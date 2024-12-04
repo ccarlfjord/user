@@ -9,11 +9,10 @@ import (
 	"os"
 	"testing"
 
-	argon2 "github.com/ccarlfjord/user-service/argon2"
-	"github.com/ccarlfjord/user-service/internal/repository"
+	"github.com/ccarlfjord/user-service/argon2"
+	"github.com/ccarlfjord/user-service/repository"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func TestCreateUser(t *testing.T) {
@@ -40,8 +39,8 @@ func TestCreateUser(t *testing.T) {
 			Email:          "test@example.com",
 			HashedPassword: pass.Hash("test123", salt),
 			Salt:           salt,
-			Active:         pgtype.Bool{Bool: true},
-			Admin:          pgtype.Bool{Bool: false},
+			Active:         true,
+			Admin:          true,
 		})
 		if err != nil {
 			log.Println(err)
