@@ -12,7 +12,11 @@ import (
 )
 
 func main() {
-	h := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{})
+	lvl := new(slog.LevelVar)
+	setLogLevel(lvl)
+	h := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: lvl,
+	})
 	logger := slog.New(h)
 	slog.SetDefault(logger)
 
@@ -35,4 +39,17 @@ func sessionToken() []byte {
 	token := make([]byte, 32)
 	rand.Read(token)
 	return token
+}
+
+func setLogLevel(lvl *slog.LevelVar) {
+	switch os.Getenv("LOGLEVEL") {
+	case "debug":
+		lvl.Set(slog.LevelDebug)
+	case "info":
+		lvl.Set(slog.LevelInfo)
+	case "error":
+		lvl.Set(slog.LevelError)
+	default:
+		lvl.Set(slog.LevelError)
+	}
 }

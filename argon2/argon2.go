@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
-	"log"
+	"log/slog"
 	"time"
 
 	"golang.org/x/crypto/argon2"
@@ -55,7 +55,7 @@ func (a *Argon2Params) Hash(password string, salt []byte) []byte {
 func (a *Argon2Params) Validate(password string, hashedPassword []byte, salt []byte) error {
 	start := time.Now()
 	defer func() {
-		log.Printf("Validate took %v", time.Since(start))
+		slog.Debug("password validation complete", "time", time.Since(start).String())
 	}()
 	h := a.Hash(password, salt)
 	if bytes.Equal(h, hashedPassword) {

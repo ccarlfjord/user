@@ -164,7 +164,8 @@ func (c *controller) login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate password
-	if err := argon2.Validate(request.Password, user.HashedPassword, user.Salt); err == nil {
+	err = argon2.Validate(request.Password, user.HashedPassword, user.Salt)
+	if err == nil {
 		now := time.Now()
 		expiresAt := now.Add(1 * time.Hour)
 
@@ -184,6 +185,9 @@ func (c *controller) login(w http.ResponseWriter, r *http.Request) {
 			Session: sessionToken,
 		})
 		return
+	}
+	if err != nil {
+		slog.Error(err.Error())
 	}
 
 	w.WriteHeader(http.StatusForbidden)
