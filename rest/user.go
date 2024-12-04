@@ -49,6 +49,12 @@ func (c *controller) getUserByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, err := c.db.GetUserById(r.Context(), uuid)
+	if err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
 	u := User{
 		ID:       user.ID,
 		Email:    user.Email,
@@ -57,18 +63,7 @@ func (c *controller) getUserByID(w http.ResponseWriter, r *http.Request) {
 		Admin:    user.Admin,
 	}
 
-	if err != nil {
-		slog.Error(err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	json, err := json.Marshal(u)
-	if err != nil {
-		slog.Error(err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	w.Write(json)
+	JSON(w, http.StatusOK, u)
 }
 
 type CreateUserRequest struct {
@@ -185,9 +180,6 @@ func (c *controller) login(w http.ResponseWriter, r *http.Request) {
 			Session: sessionToken,
 		})
 		return
-	}
-	if err != nil {
-		slog.Error(err.Error())
 	}
 
 	w.WriteHeader(http.StatusForbidden)
