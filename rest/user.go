@@ -2,19 +2,27 @@ package rest
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"log/slog"
 	"net/http"
-	"time"
 
-	"github.com/ccarlfjord/user-service/argon2"
-	"github.com/ccarlfjord/user-service/repository"
-	"github.com/golang-jwt/jwt/v5"
+	"github.com/ccarlfjord/user/argon2"
+	"github.com/ccarlfjord/user/internal/repository"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
+type User struct {
+	ID       uuid.UUID `json:"id"`
+	Email    string    `json:"email"`
+	Username string    `json:"username"`
+	Active   bool      `json:"active"`
+	Admin    bool      `json:"admin"`
+}
+
 // getUser returns a user from JSON payload
-func (c *controller) getUser(w http.ResponseWriter, r *http.Request) {
+func (h *userHandler) getUser(w http.ResponseWriter, r *http.Request) {
 	validateContentTypeJSON(w, r)
 
 	var request struct {
@@ -27,7 +35,7 @@ func (c *controller) getUser(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	u, err := c.db.GetUserByEmail(r.Context(), request.Email)
+	u, err := h.db.GetUserByEmail(r.Context(), request.Email)
 	if err == pgx.ErrNoRows {
 		slog.Debug("user not found", "user", request.Email)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -40,7 +48,7 @@ func (c *controller) getUser(w http.ResponseWriter, r *http.Request) {
 }
 
 // getUserByID returns a user by ID
-func (c *controller) getUserByID(w http.ResponseWriter, r *http.Request) {
+func (h *userHandler) getUserByID(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	uuid, err := uuid.Parse(id)
 	if err != nil {
@@ -48,7 +56,7 @@ func (c *controller) getUserByID(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	user, err := c.db.GetUserById(r.Context(), uuid)
+	user, err := h.db.GetUserById(r.Context(), uuid)
 	if err != nil {
 		slog.Error(err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
@@ -66,19 +74,19 @@ func (c *controller) getUserByID(w http.ResponseWriter, r *http.Request) {
 	JSON(w, http.StatusOK, u)
 }
 
-type CreateUserRequest struct {
+type NewUserRequest struct {
 	Email    string `json:"email"`
 	Username string `json:"username"`
 	Password string `json:"password"`
 }
 
-// createUser creates a new user
-func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
+// newUser creates a new user
+func (u *userHandler) newUser(w http.ResponseWriter, r *http.Request) {
 	// Validate content type of request is application/json
 	validateContentTypeJSON(w, r)
 
 	// Read JSON from request body
-	var req CreateUserRequest
+	var req NewUserRequest
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		slog.Error(err.Error())
@@ -88,7 +96,7 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 	salt := argon2.GenerateSalt()
 
 	// If user exists, return 200 and user
-	exists, err := c.db.GetUserByEmail(r.Context(), req.Email)
+	exists, err := u.db.GetUserByEmail(r.Context(), req.Email)
 	if err == nil {
 		JSON(w, http.StatusOK, exists)
 		return
@@ -103,7 +111,7 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 		Salt:           salt,
 	}
 
-	user, err := c.db.CreateUser(r.Context(), userParams)
+	user, err := u.db.CreateUser(r.Context(), userParams)
 	if err != nil {
 		slog.Error(err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
@@ -121,11 +129,41 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 
 // deleteUser deletes user on email or ID from request
 // ID takes precedence over email
-func (c *controller) deleteUser(w http.ResponseWriter, r *http.Request) {
+func (u *userHandler) deleteUser(w http.ResponseWriter, r *http.Request) {
 }
 
-// updateUser updates user in database with data from request
-func (c *controller) updateUser(w http.ResponseWriter, r *http.Request) {
+// storeUser updates user in database with data from request
+func (h *userHandler) storeUser(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	uuid, err := uuid.Parse(id)
+	if err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	user, err := h.db.GetUserById(r.Context(), uuid)
+	fmt.Println(user)
+	if err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	userRequest := json.NewDecoder(r.Body).Decode(&User{})
+	slog.Info(fmt.Sprintf("%v", userRequest))
+
+	_, err = h.db.StoreUser(r.Context(), repository.StoreUserParams{
+		ID:             user.ID,
+		Username:       user.Username,
+		Email:          user.Email,
+		HashedPassword: user.HashedPassword,
+		Salt:           user.Salt,
+		Active:         user.Active,
+		Admin:          user.Admin,
+	})
+	if err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+	}
 }
 
 type LoginRequest struct {
@@ -136,51 +174,28 @@ type LoginResponse struct {
 	Session string `json:"session"`
 }
 
-func (c *controller) login(w http.ResponseWriter, r *http.Request) {
-	validateContentTypeJSON(w, r)
-	var request LoginRequest
+type userHandler struct {
+	mux          http.Handler
+	db           *repository.Queries
+	sessionToken []byte
+}
 
-	err := json.NewDecoder(r.Body).Decode(&request)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+func (h *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mux.ServeHTTP(w, r)
+}
+
+func NewUserHandler(db *repository.Queries, sessionToken []byte) *userHandler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", PingHandler)
+	return &userHandler{
+		mux:          mux,
+		db:           db,
+		sessionToken: sessionToken,
 	}
+}
 
-	user, err := c.db.GetUserByEmail(r.Context(), request.Email)
-	if err != nil {
-		slog.Error(err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	if user.HashedPassword == nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	// Validate password
-	err = argon2.Validate(request.Password, user.HashedPassword, user.Salt)
-	if err == nil {
-		now := time.Now()
-		expiresAt := now.Add(1 * time.Hour)
-
-		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-			Subject:   user.ID.String(),
-			ExpiresAt: jwt.NewNumericDate(expiresAt),
-		})
-
-		sessionToken, err := token.SignedString(c.sessionToken)
-		if err != nil {
-			slog.Error(err.Error())
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		JSON(w, http.StatusOK, LoginResponse{
-			Session: sessionToken,
-		})
-		return
-	}
-
-	w.WriteHeader(http.StatusForbidden)
+func PingHandler(w http.ResponseWriter, r *http.Request) {
+	log.Println(r.URL)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("pong\n"))
 }

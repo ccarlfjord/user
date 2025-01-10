@@ -10,9 +10,6 @@ SELECT * FROM users;
 -- name: DeleteUser :exec
 DELETE FROM users WHERE id = $1;
 
--- name: StoreUser :exec
-UPDATE users SET email = $2, hashed_password = $3, salt = $4 WHERE id = $1;
-
 -- name: ActivateUser :exec
 UPDATE users SET active = TRUE WHERE id = $1;
 
@@ -29,7 +26,7 @@ UPDATE users SET admin = FALSE WHERE id = $1;
 INSERT INTO users(id, username, email, hashed_password, salt, active, admin) VALUES( $1, $2, $3, $4, $5, $6, $7)
 RETURNING *;
 
--- name: UpdateUser :one
-UPDATE users SET email = $2, hashed_password = $3, salt = $4, active = $5, admin = $6 WHERE id = $1
+-- name: StoreUser :one
+UPDATE users SET (username, email, hashed_password, salt, active, admin) = ($2, $3, $4, $5, $6, $7) WHERE id = $1
 RETURNING *;
 

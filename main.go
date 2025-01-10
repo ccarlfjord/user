@@ -5,9 +5,10 @@ import (
 	"crypto/rand"
 	"log"
 	"log/slog"
+	"net/http"
 	"os"
 
-	"github.com/ccarlfjord/user-service/rest"
+	"github.com/ccarlfjord/user/rest"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -22,7 +23,7 @@ func main() {
 
 	connString := os.Getenv("DATABASE_URL")
 	if connString == "" {
-		connString = "postgresql://postgres:postgres@localhost:5432"
+		connString = "postgres://postgres:postgres@localhost:5432"
 	}
 
 	ctx := context.Background()
@@ -32,7 +33,7 @@ func main() {
 	}
 	srv := rest.New(conn, sessionToken())
 
-	log.Fatal(srv.Run())
+	log.Fatal(http.ListenAndServe(":3000", srv))
 }
 
 func sessionToken() []byte {

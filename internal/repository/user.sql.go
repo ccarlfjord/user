@@ -164,34 +164,14 @@ func (q *Queries) SetAdmin(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
-const storeUser = `-- name: StoreUser :exec
-UPDATE users SET email = $2, hashed_password = $3, salt = $4 WHERE id = $1
+const storeUser = `-- name: StoreUser :one
+UPDATE users SET (username, email, hashed_password, salt, active, admin) = ($2, $3, $4, $5, $6, $7) WHERE id = $1
+RETURNING id, email, username, hashed_password, salt, active, admin
 `
 
 type StoreUserParams struct {
 	ID             uuid.UUID `json:"id"`
-	Email          string    `json:"email"`
-	HashedPassword []byte    `json:"hashed_password"`
-	Salt           []byte    `json:"salt"`
-}
-
-func (q *Queries) StoreUser(ctx context.Context, arg StoreUserParams) error {
-	_, err := q.db.Exec(ctx, storeUser,
-		arg.ID,
-		arg.Email,
-		arg.HashedPassword,
-		arg.Salt,
-	)
-	return err
-}
-
-const updateUser = `-- name: UpdateUser :one
-UPDATE users SET email = $2, hashed_password = $3, salt = $4, active = $5, admin = $6 WHERE id = $1
-RETURNING id, email, username, hashed_password, salt, active, admin
-`
-
-type UpdateUserParams struct {
-	ID             uuid.UUID `json:"id"`
+	Username       string    `json:"username"`
 	Email          string    `json:"email"`
 	HashedPassword []byte    `json:"hashed_password"`
 	Salt           []byte    `json:"salt"`
@@ -199,9 +179,10 @@ type UpdateUserParams struct {
 	Admin          bool      `json:"admin"`
 }
 
-func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, error) {
-	row := q.db.QueryRow(ctx, updateUser,
+func (q *Queries) StoreUser(ctx context.Context, arg StoreUserParams) (User, error) {
+	row := q.db.QueryRow(ctx, storeUser,
 		arg.ID,
+		arg.Username,
 		arg.Email,
 		arg.HashedPassword,
 		arg.Salt,
