@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/ccarlfjord/user-service/repository"
+	"github.com/ccarlfjord/user-service/internal/repository"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
