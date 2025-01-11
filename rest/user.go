@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/ccarlfjord/user-service/argon2"
-	"github.com/ccarlfjord/user-service/repository"
+	"github.com/ccarlfjord/user-service/internal/repository"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
