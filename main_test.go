@@ -33,7 +33,7 @@ func TestCreateUser(t *testing.T) {
 	// Start from a clean slate so a manually created account does not affect
 	// the test.
 	if existing, err := db.GetUserByEmail(ctx, "test@example.com"); err == nil {
-		if err := db.DeleteUser(ctx, existing.ID); err != nil {
+		if _, err := db.DeleteUser(ctx, existing.ID); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -51,7 +51,7 @@ func TestCreateUser(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		if err := db.DeleteUser(ctx, user.ID); err != nil {
+		if _, err := db.DeleteUser(ctx, user.ID); err != nil {
 			t.Error(err)
 		}
 	}()

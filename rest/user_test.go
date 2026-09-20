@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +28,8 @@ type fakeStore struct {
 	getVerificationToken            func(context.Context, []byte) (repository.VerificationToken, error)
 	deleteVerificationTokensForUser func(context.Context, uuid.UUID) error
 	activateUser                    func(context.Context, uuid.UUID) error
+	updateUser                      func(context.Context, repository.UpdateUserParams) (repository.User, error)
+	deleteUser                      func(context.Context, uuid.UUID) (int64, error)
 }
 
 func (f fakeStore) GetUserByEmail(ctx context.Context, email string) (repository.User, error) {
@@ -54,6 +58,14 @@ func (f fakeStore) DeleteVerificationTokensForUser(ctx context.Context, userID u
 
 func (f fakeStore) ActivateUser(ctx context.Context, id uuid.UUID) error {
 	return f.activateUser(ctx, id)
+}
+
+func (f fakeStore) UpdateUser(ctx context.Context, arg repository.UpdateUserParams) (repository.User, error) {
+	return f.updateUser(ctx, arg)
+}
+
+func (f fakeStore) DeleteUser(ctx context.Context, id uuid.UUID) (int64, error) {
+	return f.deleteUser(ctx, id)
 }
 
 // testSessionKey is the HMAC key newTestController signs and validates
@@ -436,6 +448,19 @@ func authRequest(t *testing.T, method, target, sub string) *http.Request {
 	return req
 }
 
+// authRequestWithBody returns an authenticated request carrying a body.
+func authRequestWithBody(t *testing.T, method, target, sub, contentType, body string) *http.Request {
+	t.Helper()
+
+	req := authRequest(t, method, target, sub)
+	req.Body = io.NopCloser(strings.NewReader(body))
+	req.ContentLength = int64(len(body))
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return req
+}
+
 // activeUser is a live account that a session subject can resolve to.
 func activeUser(admin bool) repository.User {
 	return repository.User{ID: uuid.New(), Email: "caller@example.com", Active: true, Admin: admin}
@@ -704,6 +729,489 @@ func TestGetUserByIDRequiresSelfOrAdmin(t *testing.T) {
 			}
 			if tt.want != http.StatusOK && rec.Body.Len() != 0 {
 				t.Fatalf("denied response leaked a body: %q", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestDeleteUserSelfDeletesAccount(t *testing.T) {
+	caller := activeUser(false)
+	deleted := uuid.Nil
+	store := fakeStore{
+		getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+			return caller, nil
+		},
+		deleteUser: func(_ context.Context, id uuid.UUID) (int64, error) {
+			deleted = id
+			return 1, nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := httptest.NewRecorder()
+	c.userHandler(rec, authRequestWithBody(t, http.MethodDelete, "/v1/user", caller.ID.String(), "application/json",
+		`{"id":"`+caller.ID.String()+`"}`))
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	if deleted != caller.ID {
+		t.Fatalf("deleted %s, want the caller %s", deleted, caller.ID)
+	}
+}
+
+func TestDeleteUserNonAdminMayOnlyDeleteSelf(t *testing.T) {
+	caller := activeUser(false)
+	store := fakeStore{
+		getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+			return caller, nil
+		},
+		deleteUser: func(context.Context, uuid.UUID) (int64, error) {
+			t.Fatal("store was asked to delete")
+			return 0, nil
+		},
+	}
+	c := newTestController(store)
+
+	// Another account and an unknown one are answered the same way: the refusal
+	// must not report whether the id exists.
+	for _, target := range []uuid.UUID{uuid.New(), uuid.New()} {
+		rec := httptest.NewRecorder()
+		c.userHandler(rec, authRequestWithBody(t, http.MethodDelete, "/v1/user", caller.ID.String(), "application/json",
+			`{"id":"`+target.String()+`"}`))
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", rec.Code)
+		}
+		if rec.Body.Len() != 0 {
+			t.Fatalf("denied response leaked a body: %q", rec.Body.String())
+		}
+	}
+}
+
+func TestDeleteUserByEmail(t *testing.T) {
+	caller := activeUser(false)
+	admin := activeUser(true)
+	other := repository.User{ID: uuid.New(), Email: "other@example.com", Active: true}
+
+	t.Run("self is resolved from the session", func(t *testing.T) {
+		deleted := uuid.Nil
+		store := fakeStore{
+			getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+				return caller, nil
+			},
+			getUserByEmail: func(context.Context, string) (repository.User, error) {
+				t.Fatal("the caller's own address was looked up")
+				return repository.User{}, nil
+			},
+			deleteUser: func(_ context.Context, id uuid.UUID) (int64, error) {
+				deleted = id
+				return 1, nil
+			},
+		}
+
+		rec := httptest.NewRecorder()
+		newTestController(store).userHandler(rec, authRequestWithBody(t, http.MethodDelete, "/v1/user",
+			caller.ID.String(), "application/json", `{"email":"`+caller.Email+`"}`))
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", rec.Code)
+		}
+		if deleted != caller.ID {
+			t.Fatalf("deleted %s, want the caller %s", deleted, caller.ID)
+		}
+	})
+
+	t.Run("another address is refused without a lookup", func(t *testing.T) {
+		store := fakeStore{
+			getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+				return caller, nil
+			},
+			getUserByEmail: func(context.Context, string) (repository.User, error) {
+				t.Fatal("a non-admin's request for another address reached the store")
+				return repository.User{}, nil
+			},
+			deleteUser: func(context.Context, uuid.UUID) (int64, error) {
+				t.Fatal("store was asked to delete")
+				return 0, nil
+			},
+		}
+
+		rec := httptest.NewRecorder()
+		newTestController(store).userHandler(rec, authRequestWithBody(t, http.MethodDelete, "/v1/user",
+			caller.ID.String(), "application/json", `{"email":"other@example.com"}`))
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", rec.Code)
+		}
+	})
+
+	t.Run("admin resolves another address", func(t *testing.T) {
+		deleted := uuid.Nil
+		store := fakeStore{
+			getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+				return admin, nil
+			},
+			getUserByEmail: func(_ context.Context, email string) (repository.User, error) {
+				if email != other.Email {
+					t.Fatalf("looked up %q, want %q", email, other.Email)
+				}
+				return other, nil
+			},
+			deleteUser: func(_ context.Context, id uuid.UUID) (int64, error) {
+				deleted = id
+				return 1, nil
+			},
+		}
+
+		rec := httptest.NewRecorder()
+		newTestController(store).userHandler(rec, authRequestWithBody(t, http.MethodDelete, "/v1/user",
+			admin.ID.String(), "application/json", `{"email":"`+other.Email+`"}`))
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", rec.Code)
+		}
+		if deleted != other.ID {
+			t.Fatalf("deleted %s, want %s", deleted, other.ID)
+		}
+	})
+}
+
+func TestDeleteUserIDTakesPrecedenceOverEmail(t *testing.T) {
+	admin := activeUser(true)
+	other := repository.User{ID: uuid.New(), Email: "other@example.com", Active: true}
+	deleted := uuid.Nil
+	store := fakeStore{
+		getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+			return admin, nil
+		},
+		getUserByEmail: func(context.Context, string) (repository.User, error) {
+			t.Fatal("the email was resolved although the request carried an id")
+			return repository.User{}, nil
+		},
+		deleteUser: func(_ context.Context, id uuid.UUID) (int64, error) {
+			deleted = id
+			return 1, nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := httptest.NewRecorder()
+	c.userHandler(rec, authRequestWithBody(t, http.MethodDelete, "/v1/user", admin.ID.String(), "application/json",
+		`{"id":"`+other.ID.String()+`","email":"nobody@example.com"}`))
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	if deleted != other.ID {
+		t.Fatalf("deleted %s, want the id %s", deleted, other.ID)
+	}
+}
+
+func TestDeleteUserMissingAccount(t *testing.T) {
+	admin := activeUser(true)
+	tests := []struct {
+		name    string
+		deleted int64
+		err     error
+		want    int
+	}{
+		{"no such account", 0, nil, http.StatusNotFound},
+		{"store failure", 0, errors.New("connection reset"), http.StatusInternalServerError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := fakeStore{
+				getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+					return admin, nil
+				},
+				deleteUser: func(context.Context, uuid.UUID) (int64, error) {
+					return tt.deleted, tt.err
+				},
+			}
+
+			rec := httptest.NewRecorder()
+			newTestController(store).userHandler(rec, authRequestWithBody(t, http.MethodDelete, "/v1/user",
+				admin.ID.String(), "application/json", `{"id":"`+uuid.New().String()+`"}`))
+
+			if rec.Code != tt.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeleteUserBadRequests(t *testing.T) {
+	caller := activeUser(false)
+	c := newTestController(fakeStore{
+		getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+			return caller, nil
+		},
+	})
+
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{"bad content type", "text/plain", `{"id":"` + caller.ID.String() + `"}`},
+		{"malformed json", "application/json", `{`},
+		{"neither id nor email", "application/json", `{}`},
+		{"unparseable id", "application/json", `{"id":"not-a-uuid"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c.userHandler(rec, authRequestWithBody(t, http.MethodDelete, "/v1/user", caller.ID.String(),
+				tt.contentType, tt.body))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", rec.Code)
+			}
+		})
+	}
+}
+
+func TestUpdateUserChangesPassword(t *testing.T) {
+	oldSalt := []byte("0123456789abcdef")
+	caller := activeUser(false)
+	caller.HashedPassword = argon2.HashPassword("oldpassword", oldSalt)
+	caller.Salt = oldSalt
+
+	var stored repository.UpdateUserParams
+	store := fakeStore{
+		getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+			return caller, nil
+		},
+		updateUser: func(_ context.Context, arg repository.UpdateUserParams) (repository.User, error) {
+			stored = arg
+			return repository.User{ID: arg.ID, Email: arg.Email, Active: arg.Active, Admin: arg.Admin}, nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := httptest.NewRecorder()
+	c.userHandler(rec, authRequestWithBody(t, http.MethodPatch, "/v1/user", caller.ID.String(), "application/json",
+		`{"id":"`+caller.ID.String()+`","password":"newpassword"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if err := argon2.Validate("newpassword", stored.HashedPassword, stored.Salt); err != nil {
+		t.Fatalf("stored credential does not validate the new password: %v", err)
+	}
+	if bytes.Equal(stored.Salt, oldSalt) {
+		t.Fatal("password change reused the stored salt")
+	}
+	// The update rewrites the whole row, so the fields the request did not
+	// mention have to come back unchanged.
+	if stored.Email != caller.Email || !stored.Active || stored.Admin {
+		t.Fatalf("untouched fields changed: %+v", stored)
+	}
+	if bytes.Contains(rec.Body.Bytes(), stored.HashedPassword) || bytes.Contains(rec.Body.Bytes(), stored.Salt) {
+		t.Fatal("response leaked stored password material")
+	}
+}
+
+func TestUpdateUserChangesEmailKeepsCredential(t *testing.T) {
+	salt := []byte("0123456789abcdef")
+	caller := activeUser(false)
+	caller.HashedPassword = argon2.HashPassword("oldpassword", salt)
+	caller.Salt = salt
+
+	var stored repository.UpdateUserParams
+	store := fakeStore{
+		getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+			return caller, nil
+		},
+		updateUser: func(_ context.Context, arg repository.UpdateUserParams) (repository.User, error) {
+			stored = arg
+			return repository.User{ID: arg.ID, Email: arg.Email, Active: arg.Active, Admin: arg.Admin}, nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := httptest.NewRecorder()
+	c.userHandler(rec, authRequestWithBody(t, http.MethodPatch, "/v1/user", caller.ID.String(), "application/json",
+		`{"id":"`+caller.ID.String()+`","email":"new@example.com"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if stored.Email != "new@example.com" {
+		t.Fatalf("email = %q, want new@example.com", stored.Email)
+	}
+	if !bytes.Equal(stored.Salt, salt) {
+		t.Fatal("email change replaced the stored salt")
+	}
+	if err := argon2.Validate("oldpassword", stored.HashedPassword, stored.Salt); err != nil {
+		t.Fatalf("email change disturbed the stored credential: %v", err)
+	}
+
+	var got User
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Email != "new@example.com" || got.ID != caller.ID {
+		t.Fatalf("response = %+v, want the updated account", got)
+	}
+}
+
+func TestUpdateUserNonAdminMayNotWritePrivilegedFields(t *testing.T) {
+	caller := activeUser(false)
+	other := repository.User{ID: uuid.New(), Email: "other@example.com", Active: true}
+
+	store := fakeStore{
+		getUserById: func(_ context.Context, id uuid.UUID) (repository.User, error) {
+			if id == other.ID {
+				return other, nil
+			}
+			return caller, nil
+		},
+		updateUser: func(context.Context, repository.UpdateUserParams) (repository.User, error) {
+			t.Fatal("store was asked to update")
+			return repository.User{}, nil
+		},
+	}
+	c := newTestController(store)
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"self deactivation", `{"id":"` + caller.ID.String() + `","active":false}`},
+		{"self promotion", `{"id":"` + caller.ID.String() + `","admin":true}`},
+		{"self demotion", `{"id":"` + caller.ID.String() + `","admin":false}`},
+		{"another account", `{"id":"` + other.ID.String() + `","email":"mine@example.com"}`},
+		{"unknown account", `{"id":"` + uuid.New().String() + `","email":"mine@example.com"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c.userHandler(rec, authRequestWithBody(t, http.MethodPatch, "/v1/user", caller.ID.String(),
+				"application/json", tt.body))
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403", rec.Code)
+			}
+			if rec.Body.Len() != 0 {
+				t.Fatalf("denied response leaked a body: %q", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestUpdateUserAdminMaySetPrivilegedFields(t *testing.T) {
+	admin := activeUser(true)
+	other := repository.User{ID: uuid.New(), Email: "other@example.com", Active: false}
+
+	var stored repository.UpdateUserParams
+	store := fakeStore{
+		getUserById: func(_ context.Context, id uuid.UUID) (repository.User, error) {
+			if id == other.ID {
+				return other, nil
+			}
+			return admin, nil
+		},
+		updateUser: func(_ context.Context, arg repository.UpdateUserParams) (repository.User, error) {
+			stored = arg
+			return repository.User{ID: arg.ID, Email: arg.Email, Active: arg.Active, Admin: arg.Admin}, nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := httptest.NewRecorder()
+	c.userHandler(rec, authRequestWithBody(t, http.MethodPatch, "/v1/user", admin.ID.String(), "application/json",
+		`{"id":"`+other.ID.String()+`","active":true,"admin":true}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !stored.Active || !stored.Admin {
+		t.Fatalf("active = %v, admin = %v, want both true", stored.Active, stored.Admin)
+	}
+	if stored.Email != other.Email {
+		t.Fatalf("email = %q, want the stored %q", stored.Email, other.Email)
+	}
+}
+
+func TestUpdateUserStoreErrors(t *testing.T) {
+	admin := activeUser(true)
+	target := uuid.New()
+
+	tests := []struct {
+		name      string
+		getErr    error
+		updateErr error
+		want      int
+	}{
+		{"unknown account", pgx.ErrNoRows, nil, http.StatusNotFound},
+		{"duplicate email", nil, &pgconn.PgError{Code: "23505"}, http.StatusConflict},
+		{"store failure", nil, errors.New("connection reset"), http.StatusInternalServerError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := fakeStore{
+				getUserById: func(_ context.Context, id uuid.UUID) (repository.User, error) {
+					if id != target {
+						// requireSession resolves the caller first.
+						return admin, nil
+					}
+					if tt.getErr != nil {
+						return repository.User{}, tt.getErr
+					}
+					return repository.User{ID: target, Email: "other@example.com", Active: true}, nil
+				},
+				updateUser: func(context.Context, repository.UpdateUserParams) (repository.User, error) {
+					return repository.User{}, tt.updateErr
+				},
+			}
+
+			rec := httptest.NewRecorder()
+			newTestController(store).userHandler(rec, authRequestWithBody(t, http.MethodPatch, "/v1/user",
+				admin.ID.String(), "application/json",
+				`{"id":"`+target.String()+`","email":"taken@example.com"}`))
+
+			if rec.Code != tt.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdateUserBadRequests(t *testing.T) {
+	caller := activeUser(false)
+	c := newTestController(fakeStore{
+		getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+			return caller, nil
+		},
+	})
+
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{"bad content type", "text/plain", `{"id":"` + caller.ID.String() + `"}`},
+		{"malformed json", "application/json", `{`},
+		{"missing id", "application/json", `{"password":"newpassword"}`},
+		{"unparseable id", "application/json", `{"id":"not-a-uuid"}`},
+		{"empty email", "application/json", `{"id":"` + caller.ID.String() + `","email":""}`},
+		{"short password", "application/json", `{"id":"` + caller.ID.String() + `","password":"short"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c.userHandler(rec, authRequestWithBody(t, http.MethodPatch, "/v1/user", caller.ID.String(),
+				tt.contentType, tt.body))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", rec.Code)
 			}
 		})
 	}
