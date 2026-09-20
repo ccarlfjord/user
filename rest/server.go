@@ -86,6 +86,8 @@ func (c *controller) loginHandler(w http.ResponseWriter, r *http.Request) {
 
 func (c *controller) userHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
+	case http.MethodGet:
+		c.requireSession(c.getUser)(w, r)
 	case http.MethodPost:
 		c.createUser(w, r)
 	case http.MethodDelete:
