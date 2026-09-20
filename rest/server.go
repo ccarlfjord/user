@@ -25,6 +25,8 @@ type userStore interface {
 	GetVerificationToken(ctx context.Context, tokenHash []byte) (repository.VerificationToken, error)
 	DeleteVerificationTokensForUser(ctx context.Context, userID uuid.UUID) error
 	ActivateUser(ctx context.Context, id uuid.UUID) error
+	UpdateUser(ctx context.Context, arg repository.UpdateUserParams) (repository.User, error)
+	DeleteUser(ctx context.Context, id uuid.UUID) (int64, error)
 }
 
 type controller struct {

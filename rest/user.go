@@ -185,13 +185,216 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 	JSON(w, http.StatusCreated, signupResponse{Status: "ok"})
 }
 
-// deleteUser deletes user on email or ID from request
-// ID takes precedence over email
-func (c *controller) deleteUser(w http.ResponseWriter, r *http.Request) {
+// deleteUserRequest names the account to delete. ID takes precedence over
+// email when both are given.
+type deleteUserRequest struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
 }
 
-// updateUser updates user in database with data from request
+// deleteUser deletes user on email or ID from request
+// ID takes precedence over email. The caller may delete their own account;
+// deleting anyone else's requires admin.
+func (c *controller) deleteUser(w http.ResponseWriter, r *http.Request) {
+	if !validateContentTypeJSON(w, r) {
+		return
+	}
+
+	var req deleteUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	_, target, ok := c.authorizeTarget(w, r, req.ID, req.Email)
+	if !ok {
+		return
+	}
+
+	deleted, err := c.db.DeleteUser(r.Context(), target)
+	if err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if deleted == 0 {
+		// Authorized, but no such account.
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// updateUserRequest is a partial update: a field is written only when it is
+// present in the body, so an omitted field keeps its stored value. A JSON null
+// reads as omitted. The account is always named by ID — an email here means
+// "change the address", never "pick the account".
+type updateUserRequest struct {
+	ID       string  `json:"id"`
+	Email    *string `json:"email"`
+	Password *string `json:"password"`
+	Active   *bool   `json:"active"`
+	Admin    *bool   `json:"admin"`
+}
+
+// updateUser updates user in database with data from request.
+// The caller may change their own email and password; every other field, and
+// any account but their own, requires admin.
 func (c *controller) updateUser(w http.ResponseWriter, r *http.Request) {
+	if !validateContentTypeJSON(w, r) {
+		return
+	}
+
+	var req updateUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if req.ID == "" {
+		PlainText(w, http.StatusBadRequest, "missing id")
+		return
+	}
+
+	caller, target, ok := c.authorizeTarget(w, r, req.ID, "")
+	if !ok {
+		return
+	}
+
+	// Refused before the row is read: active and admin are not a caller's to
+	// write, not even on their own account.
+	if (req.Active != nil || req.Admin != nil) && !caller.Admin {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	if req.Email != nil && *req.Email == "" {
+		PlainText(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if req.Password != nil && len(*req.Password) < 8 {
+		PlainText(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+
+	current, err := c.db.GetUserById(r.Context(), target)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error(err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	// UpdateUser rewrites the whole row, so the fields the request does not
+	// mention are carried over from the stored account.
+	if req.Email != nil {
+		current.Email = *req.Email
+	}
+	if req.Password != nil {
+		// A new password gets a new salt: keeping the old one would let two
+		// accounts that share a password share a digest.
+		current.Salt = argon2.GenerateSalt()
+		current.HashedPassword = argon2.HashPassword(*req.Password, current.Salt)
+	}
+	if req.Active != nil {
+		current.Active = *req.Active
+	}
+	if req.Admin != nil {
+		current.Admin = *req.Admin
+	}
+
+	updated, err := c.db.UpdateUser(r.Context(), repository.UpdateUserParams{
+		ID:             current.ID,
+		Email:          current.Email,
+		HashedPassword: current.HashedPassword,
+		Salt:           current.Salt,
+		Active:         current.Active,
+		Admin:          current.Admin,
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			PlainText(w, http.StatusConflict, "email already registered")
+			return
+		}
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	JSON(w, http.StatusOK, publicUser(updated))
+}
+
+// authorizeTarget resolves the account named by an ID or an email — ID takes
+// precedence — and reports whether the caller may act on it. When it reports
+// false the response has already been written.
+func (c *controller) authorizeTarget(w http.ResponseWriter, r *http.Request, id, email string) (repository.User, uuid.UUID, bool) {
+	caller, ok := callerFrom(r.Context())
+	if !ok {
+		// Only reachable if this handler is wired without requireSession.
+		unauthorized(w)
+		return repository.User{}, uuid.Nil, false
+	}
+
+	target, ok := c.resolveTarget(w, r, caller, id, email)
+	if !ok {
+		return repository.User{}, uuid.Nil, false
+	}
+
+	if !mayAccessUser(caller, target) {
+		// Checked before the lookup, so a denial does not confirm that the
+		// target exists.
+		w.WriteHeader(http.StatusForbidden)
+		return repository.User{}, uuid.Nil, false
+	}
+
+	return caller, target, true
+}
+
+// resolveTarget turns the id/email pair in a request into the UUID of the
+// account it names. A caller that is not an admin is held to their own
+// identity before anything is looked up, so asking about an address that is
+// not theirs cannot be used to test whether it is registered.
+func (c *controller) resolveTarget(w http.ResponseWriter, r *http.Request, caller repository.User, id, email string) (uuid.UUID, bool) {
+	if id != "" {
+		userID, err := uuid.Parse(id)
+		if err != nil {
+			PlainText(w, http.StatusBadRequest, "invalid id")
+			return uuid.Nil, false
+		}
+		return userID, true
+	}
+
+	if email == "" {
+		PlainText(w, http.StatusBadRequest, "missing id or email")
+		return uuid.Nil, false
+	}
+
+	if !caller.Admin {
+		if email != caller.Email {
+			w.WriteHeader(http.StatusForbidden)
+			return uuid.Nil, false
+		}
+		return caller.ID, true
+	}
+
+	user, err := c.db.GetUserByEmail(r.Context(), email)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error(err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return uuid.Nil, false
+		}
+		w.WriteHeader(http.StatusNotFound)
+		return uuid.Nil, false
+	}
+	return user.ID, true
 }
 
 type LoginRequest struct {
