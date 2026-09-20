@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/ccarlfjord/user/internal/repository"
 	"github.com/ccarlfjord/user/rest"
 	"github.com/jackc/pgx/v5"
 )
@@ -30,15 +31,35 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := rest.New(conn, sessionToken())
+
+	signingKey, err := loadSigningKey(ctx, conn)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	srv := rest.New(conn, signingKey)
 
 	log.Fatal(srv.Run())
 }
 
-func sessionToken() []byte {
-	token := make([]byte, 32)
-	rand.Read(token)
-	return token
+// loadSigningKey returns the shared JWT signing key from the database,
+// generating and persisting a new one on first boot.
+func loadSigningKey(ctx context.Context, conn *pgx.Conn) ([]byte, error) {
+	db := repository.New(conn)
+
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, err
+	}
+
+	signingKey, err := db.GetOrCreateSigningKey(ctx, repository.GetOrCreateSigningKeyParams{
+		Name:  "jwt_signing_key",
+		Value: key,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return signingKey.Value, nil
 }
 
 func setLogLevel(lvl *slog.LevelVar) {
@@ -50,6 +71,6 @@ func setLogLevel(lvl *slog.LevelVar) {
 	case "error":
 		lvl.Set(slog.LevelError)
 	default:
-		lvl.Set(slog.LevelError)
+		lvl.Set(slog.LevelInfo)
 	}
 }
