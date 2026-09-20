@@ -123,10 +123,13 @@ func (c *controller) requireSession(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		claims := new(jwt.RegisteredClaims)
+		claims := new(sessionClaims)
 		_, err := jwt.ParseWithClaims(raw, claims, c.sessionKey,
 			jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
 			jwt.WithExpirationRequired(),
+			jwt.WithIssuer(sessionIssuer),
+			jwt.WithAudience(sessionAudience),
+			jwt.WithIssuedAt(),
 		)
 		if err != nil {
 			slog.Debug("rejected session token", "error", err)
@@ -155,6 +158,17 @@ func (c *controller) requireSession(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if !caller.Active {
+			unauthorized(w)
+			return
+		}
+
+		// A password change bumps the account's session epoch, retiring every
+		// session minted before it: without this a token stolen before the
+		// change would stay usable until it expired. Requiring the claim keeps
+		// a token from omitting it and comparing equal to a stale generation.
+		if claims.SessionEpoch == nil || *claims.SessionEpoch != caller.SessionEpoch {
+			slog.Debug("rejected session from a retired session epoch",
+				"subject", claims.Subject, "epoch", claims.SessionEpoch)
 			unauthorized(w)
 			return
 		}

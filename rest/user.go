@@ -21,6 +21,25 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// sessionIssuer and sessionAudience identify this service in the sessions it
+// mints. A token minted for another audience is rejected here even if that
+// service shares the signing key, which is a real risk while the key lives in
+// a database table any deployment can read.
+const (
+	sessionIssuer   = "ccarlfjord/user"
+	sessionAudience = "user-api"
+)
+
+// sessionClaims is what a session token carries. The registered claims say who
+// it is for and when it dies; SessionEpoch ties it to the account's current
+// session generation, so a password change retires every session minted before
+// it. The epoch is a pointer so a token that omits the claim is refused rather
+// than read as generation zero.
+type sessionClaims struct {
+	jwt.RegisteredClaims
+	SessionEpoch *int32 `json:"epoch"`
+}
+
 // getUser returns the caller's own record, or the account named by the email
 // query parameter. Naming another account requires admin; a non-admin's own
 // address is resolved from the session, so an address that is not theirs is
@@ -310,6 +329,10 @@ func (c *controller) updateUser(w http.ResponseWriter, r *http.Request) {
 		// accounts that share a password share a digest.
 		current.Salt = argon2.GenerateSalt()
 		current.HashedPassword = argon2.HashPassword(*req.Password, current.Salt)
+		// Bumping the epoch retires every session minted before this moment,
+		// so changing a password takes away a token that is already in the
+		// wrong hands — including the caller's own, which has to log in again.
+		current.SessionEpoch++
 	}
 	if req.Active != nil {
 		current.Active = *req.Active
@@ -325,6 +348,7 @@ func (c *controller) updateUser(w http.ResponseWriter, r *http.Request) {
 		Salt:           current.Salt,
 		Active:         current.Active,
 		Admin:          current.Admin,
+		SessionEpoch:   current.SessionEpoch,
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -466,11 +490,16 @@ func (c *controller) login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	expiresAt := now.Add(1 * time.Hour)
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		Subject:   user.ID.String(),
-		ExpiresAt: jwt.NewNumericDate(expiresAt),
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, sessionClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    sessionIssuer,
+			Subject:   user.ID.String(),
+			Audience:  jwt.ClaimStrings{sessionAudience},
+			ExpiresAt: jwt.NewNumericDate(now.Add(1 * time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(now),
+		},
+		SessionEpoch: &user.SessionEpoch,
 	})
 
 	sessionToken, err := token.SignedString(c.sessionToken)

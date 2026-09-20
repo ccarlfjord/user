@@ -22,7 +22,7 @@ func (q *Queries) ActivateUser(ctx context.Context, id uuid.UUID) error {
 
 const createUser = `-- name: CreateUser :one
 INSERT INTO users(id, email, hashed_password, salt, active, admin) VALUES( $1, $2, $3, $4, $5, $6)
-RETURNING id, email, hashed_password, salt, active, admin
+RETURNING id, email, hashed_password, salt, active, admin, session_epoch
 `
 
 type CreateUserParams struct {
@@ -51,6 +51,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.Salt,
 		&i.Active,
 		&i.Admin,
+		&i.SessionEpoch,
 	)
 	return i, err
 }
@@ -86,7 +87,7 @@ func (q *Queries) DisableAdmin(ctx context.Context, id uuid.UUID) error {
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, hashed_password, salt, active, admin FROM users WHERE email = $1
+SELECT id, email, hashed_password, salt, active, admin, session_epoch FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -99,12 +100,13 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.Salt,
 		&i.Active,
 		&i.Admin,
+		&i.SessionEpoch,
 	)
 	return i, err
 }
 
 const getUserById = `-- name: GetUserById :one
-SELECT id, email, hashed_password, salt, active, admin FROM users WHERE id = $1
+SELECT id, email, hashed_password, salt, active, admin, session_epoch FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserById(ctx context.Context, id uuid.UUID) (User, error) {
@@ -117,12 +119,13 @@ func (q *Queries) GetUserById(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.Salt,
 		&i.Active,
 		&i.Admin,
+		&i.SessionEpoch,
 	)
 	return i, err
 }
 
 const getUsers = `-- name: GetUsers :many
-SELECT id, email, hashed_password, salt, active, admin FROM users
+SELECT id, email, hashed_password, salt, active, admin, session_epoch FROM users
 `
 
 func (q *Queries) GetUsers(ctx context.Context) ([]User, error) {
@@ -141,6 +144,7 @@ func (q *Queries) GetUsers(ctx context.Context) ([]User, error) {
 			&i.Salt,
 			&i.Active,
 			&i.Admin,
+			&i.SessionEpoch,
 		); err != nil {
 			return nil, err
 		}
@@ -183,8 +187,8 @@ func (q *Queries) StoreUser(ctx context.Context, arg StoreUserParams) error {
 }
 
 const updateUser = `-- name: UpdateUser :one
-UPDATE users SET email = $2, hashed_password = $3, salt = $4, active = $5, admin = $6 WHERE id = $1
-RETURNING id, email, hashed_password, salt, active, admin
+UPDATE users SET email = $2, hashed_password = $3, salt = $4, active = $5, admin = $6, session_epoch = $7 WHERE id = $1
+RETURNING id, email, hashed_password, salt, active, admin, session_epoch
 `
 
 type UpdateUserParams struct {
@@ -194,6 +198,7 @@ type UpdateUserParams struct {
 	Salt           []byte    `json:"salt"`
 	Active         bool      `json:"active"`
 	Admin          bool      `json:"admin"`
+	SessionEpoch   int32     `json:"session_epoch"`
 }
 
 func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, error) {
@@ -204,6 +209,7 @@ func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, e
 		arg.Salt,
 		arg.Active,
 		arg.Admin,
+		arg.SessionEpoch,
 	)
 	var i User
 	err := row.Scan(
@@ -213,6 +219,7 @@ func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, e
 		&i.Salt,
 		&i.Active,
 		&i.Admin,
+		&i.SessionEpoch,
 	)
 	return i, err
 }

@@ -10,6 +10,8 @@ Ordered by priority; every item is grounded in the code as it stands.
 - [x] The relocation (generated `signing_key`/`verification_token` queries, `sql/`, `static/`, session
       validation) is committed in `2342a24`; the working tree is clean apart from this file.
 - [x] `sqlc generate` reproduces the checked-in tree unchanged (`sqlc v1.31.1`).
+- [x] `000004_session_invalidation` is applied to the local database by hand, as every migration is until a
+      runner exists (see the P1 item); the `down` really reverses the `up`, unlike `000002`/`000003`.
 
 ## P0 — handlers
 
@@ -67,8 +69,18 @@ Ordered by priority; every item is grounded in the code as it stands.
       and the unique index will not catch it. Normalize on write/read or use `citext`.
 - [ ] `login` returns `403 "account not verified"` for inactive users after a successful password check, which
       confirms a valid credential pair. Decide whether that leak is acceptable.
-- [ ] Sessions are 1h HS256 JWTs with no `jti`, issuer or audience, and there is no logout or refresh path and
-      no revocation list.
+- [x] Session claims and password-change invalidation. Tokens carry `iss`/`aud` (the `sessionIssuer`/`sessionAudience`
+      constants in `rest/user.go`) that `requireSession` enforces with `jwt.WithIssuer`/`jwt.WithAudience`, plus
+      `iat` and a custom `epoch` claim. `users.session_epoch` (migration `000004_session_invalidation`) is bumped
+      by `updateUser` whenever the password changes, and `requireSession` rejects a token whose `epoch` is absent
+      or differs from the stored value — so a password change retires every session minted before it, including
+      the caller's own. A counter rather than a timestamp because the signing key is shared through the database
+      (more than one instance may serve a request) and JWT date claims have one-second resolution: a timestamp
+      version rejected sessions minted in the same second as the change, which the live smoke test caught.
+      Deploying this ends every session in circulation — old tokens carry no `aud`/`epoch` and fail parsing.
+- [ ] Still open on sessions: no `jti`, so there is no logout endpoint and no per-session revocation — bumping
+      `session_epoch` is only the whole-account version of that; no refresh path, and tokens stay 1h with no
+      rotation.
 
 ## P1 — schema and repository
 

@@ -23,6 +23,7 @@ type User struct {
 	Salt           []byte    `json:"salt"`
 	Active         bool      `json:"active"`
 	Admin          bool      `json:"admin"`
+	SessionEpoch   int32     `json:"session_epoch"`
 }
 
 type VerificationToken struct {

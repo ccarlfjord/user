@@ -30,6 +30,6 @@ INSERT INTO users(id, email, hashed_password, salt, active, admin) VALUES( $1, $
 RETURNING *;
 
 -- name: UpdateUser :one
-UPDATE users SET email = $2, hashed_password = $3, salt = $4, active = $5, admin = $6 WHERE id = $1
+UPDATE users SET email = $2, hashed_password = $3, salt = $4, active = $5, admin = $6, session_epoch = $7 WHERE id = $1
 RETURNING *;
 
