@@ -644,6 +644,7 @@ func TestProtectedRoutesRequireSession(t *testing.T) {
 		target  string
 	}{
 		{"get user by id", c.userByIDHandler, http.MethodGet, "/v1/user/" + caller.ID.String()},
+		{"get user", c.userHandler, http.MethodGet, "/v1/user"},
 		{"delete user", c.userHandler, http.MethodDelete, "/v1/user"},
 		{"update user", c.userHandler, http.MethodPatch, "/v1/user"},
 	}
@@ -732,6 +733,177 @@ func TestGetUserByIDRequiresSelfOrAdmin(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetUserSelfWithoutQueryReadsSession(t *testing.T) {
+	caller := activeUser(false)
+	lookups := 0
+	store := fakeStore{
+		getUserById: func(_ context.Context, id uuid.UUID) (repository.User, error) {
+			lookups++
+			if id != caller.ID {
+				t.Fatalf("looked up %s, want the session subject %s", id, caller.ID)
+			}
+			return caller, nil
+		},
+		getUserByEmail: func(context.Context, string) (repository.User, error) {
+			t.Fatal("a query-less read touched the email lookup")
+			return repository.User{}, nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := httptest.NewRecorder()
+	c.userHandler(rec, authRequest(t, http.MethodGet, "/v1/user", caller.ID.String()))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got User
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	want := User{ID: caller.ID, Email: caller.Email, Active: caller.Active, Admin: caller.Admin}
+	if got != want {
+		t.Fatalf("body = %+v, want the caller's record %+v", got, want)
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte("hashed_password")) || bytes.Contains(rec.Body.Bytes(), []byte("salt")) {
+		t.Fatalf("response leaked stored password material: %q", rec.Body.String())
+	}
+	// Only the session subject is resolved; the record itself comes from the
+	// request context.
+	if lookups != 1 {
+		t.Fatalf("lookups = %d, want 1", lookups)
+	}
+}
+
+func TestGetUserByEmail(t *testing.T) {
+	caller := activeUser(false)
+	admin := activeUser(true)
+	other := repository.User{ID: uuid.New(), Email: "other@example.com", Active: true, Admin: true}
+
+	t.Run("own address is resolved from the session", func(t *testing.T) {
+		store := fakeStore{
+			getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+				return caller, nil
+			},
+			getUserByEmail: func(context.Context, string) (repository.User, error) {
+				t.Fatal("the caller's own address was looked up")
+				return repository.User{}, nil
+			},
+		}
+
+		rec := httptest.NewRecorder()
+		newTestController(store).userHandler(rec, authRequest(t, http.MethodGet,
+			"/v1/user?email="+caller.Email, caller.ID.String()))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		var got User
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if got.ID != caller.ID {
+			t.Fatalf("id = %s, want the caller %s", got.ID, caller.ID)
+		}
+	})
+
+	t.Run("another address is refused without a lookup", func(t *testing.T) {
+		lookups := 0
+		store := fakeStore{
+			getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+				lookups++
+				return caller, nil
+			},
+			getUserByEmail: func(context.Context, string) (repository.User, error) {
+				t.Fatal("a non-admin's request for another address reached the store")
+				return repository.User{}, nil
+			},
+		}
+
+		rec := httptest.NewRecorder()
+		newTestController(store).userHandler(rec, authRequest(t, http.MethodGet,
+			"/v1/user?email="+other.Email, caller.ID.String()))
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", rec.Code)
+		}
+		if rec.Body.Len() != 0 {
+			t.Fatalf("denied response leaked a body: %q", rec.Body.String())
+		}
+		if lookups != 1 {
+			t.Fatalf("lookups = %d, want 1 (the session subject only)", lookups)
+		}
+	})
+
+	t.Run("admin reads another account", func(t *testing.T) {
+		store := fakeStore{
+			getUserById: func(_ context.Context, id uuid.UUID) (repository.User, error) {
+				if id == other.ID {
+					return other, nil
+				}
+				return admin, nil
+			},
+			getUserByEmail: func(_ context.Context, email string) (repository.User, error) {
+				if email != other.Email {
+					t.Fatalf("looked up %q, want %q", email, other.Email)
+				}
+				return other, nil
+			},
+		}
+
+		rec := httptest.NewRecorder()
+		newTestController(store).userHandler(rec, authRequest(t, http.MethodGet,
+			"/v1/user?email="+other.Email, admin.ID.String()))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		var got User
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		want := User{ID: other.ID, Email: other.Email, Active: other.Active, Admin: other.Admin}
+		if got != want {
+			t.Fatalf("body = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("missing and failing reads", func(t *testing.T) {
+		tests := []struct {
+			name string
+			err  error
+			want int
+		}{
+			{"unknown address", pgx.ErrNoRows, http.StatusNotFound},
+			{"store failure", errors.New("connection reset"), http.StatusInternalServerError},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				store := fakeStore{
+					getUserById: func(_ context.Context, id uuid.UUID) (repository.User, error) {
+						if id != other.ID {
+							return admin, nil
+						}
+						return repository.User{}, tt.err
+					},
+					getUserByEmail: func(context.Context, string) (repository.User, error) {
+						return other, nil
+					},
+				}
+
+				rec := httptest.NewRecorder()
+				newTestController(store).userHandler(rec, authRequest(t, http.MethodGet,
+					"/v1/user?email="+other.Email, admin.ID.String()))
+
+				if rec.Code != tt.want {
+					t.Fatalf("status = %d, want %d", rec.Code, tt.want)
+				}
+			})
+		}
+	})
 }
 
 func TestDeleteUserSelfDeletesAccount(t *testing.T) {

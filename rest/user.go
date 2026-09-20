@@ -21,28 +21,37 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// getUser returns a user from JSON payload. It is intentionally not routed:
-// exposing an unauthenticated lookup by email would let clients enumerate
-// registered accounts.
+// getUser returns the caller's own record, or the account named by the email
+// query parameter. Naming another account requires admin; a non-admin's own
+// address is resolved from the session, so an address that is not theirs is
+// refused before any lookup and the route cannot be used to test whether an
+// address is registered.
 func (c *controller) getUser(w http.ResponseWriter, r *http.Request) {
-	if !validateContentTypeJSON(w, r) {
+	email := r.URL.Query().Get("email")
+	if email == "" {
+		// No account named: the caller's own record, straight from the session.
+		caller, ok := callerFrom(r.Context())
+		if !ok {
+			// Only reachable if this handler is wired without requireSession.
+			unauthorized(w)
+			return
+		}
+
+		JSON(w, http.StatusOK, publicUser(caller))
 		return
 	}
 
-	var request struct {
-		Email string `json:"email"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		slog.Error(err.Error())
-		w.WriteHeader(http.StatusBadRequest)
+	_, target, ok := c.authorizeTarget(w, r, "", email)
+	if !ok {
 		return
 	}
 
-	user, err := c.db.GetUserByEmail(r.Context(), request.Email)
+	user, err := c.db.GetUserById(r.Context(), target)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			slog.Error(err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		w.WriteHeader(http.StatusNotFound)
 		return
