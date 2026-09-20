@@ -51,12 +51,27 @@ func (c *controller) getUser(w http.ResponseWriter, r *http.Request) {
 	JSON(w, http.StatusOK, publicUser(user))
 }
 
-// getUserByID returns a user by ID
+// getUserByID returns a user by ID. The caller may read their own record;
+// reading anyone else's requires admin.
 func (c *controller) getUserByID(w http.ResponseWriter, r *http.Request) {
+	caller, ok := callerFrom(r.Context())
+	if !ok {
+		// Only reachable if this handler is wired without requireSession.
+		unauthorized(w)
+		return
+	}
+
 	id := r.PathValue("id")
 	userID, err := uuid.Parse(id)
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	if !mayAccessUser(caller, userID) {
+		// Checked before the lookup, so a denial does not confirm that the
+		// target exists.
+		w.WriteHeader(http.StatusForbidden)
 		return
 	}
 
@@ -83,9 +98,9 @@ type signupResponse struct {
 	Status string `json:"status"`
 }
 
-// createUser creates a new user. The response is intentionally identical
-// whether the email was free or already registered, to avoid account
-// enumeration.
+// createUser creates a new user. Both the response and the work performed are
+// intentionally identical whether the email was free or already registered, so
+// neither the body nor the timing reveals which addresses are registered.
 func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 	if !validateContentTypeJSON(w, r) {
 		return
@@ -103,6 +118,13 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Derive before looking the address up. A signup attempt must pay the same
+	// argon2id cost whatever the lookup returns, or the response time reports
+	// whether the address is already registered. The salt and hash are only
+	// stored when the address turns out to be free.
+	salt := argon2.GenerateSalt()
+	hashedPassword := argon2.HashPassword(req.Password, salt)
+
 	_, err := c.db.GetUserByEmail(r.Context(), req.Email)
 	switch {
 	case err == nil:
@@ -115,11 +137,10 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	salt := argon2.GenerateSalt()
 	userParams := repository.CreateUserParams{
 		ID:             uuid.New(),
 		Email:          req.Email,
-		HashedPassword: argon2.HashPassword(req.Password, salt),
+		HashedPassword: hashedPassword,
 		Salt:           salt,
 	}
 
@@ -181,6 +202,16 @@ type LoginResponse struct {
 	Session string `json:"session"`
 }
 
+// decoySalt and decoyHash stand in when there is no stored credential to check
+// against. Every login attempt must pay exactly one argon2id derivation, or the
+// response time reveals whether an email is registered. The digest is a fixed
+// random value with no known preimage, so it cannot be produced by supplying a
+// password; `stored` in login keeps it from admitting anyone even if it were.
+var (
+	decoySalt = []byte{0x24, 0x5d, 0x07, 0x6e, 0xfd, 0x31, 0x11, 0x87, 0x97, 0x95, 0x48, 0x12, 0x7d, 0x0e, 0x23, 0x29}
+	decoyHash = []byte{0x55, 0x6a, 0xb6, 0x0f, 0xb0, 0x7d, 0xb6, 0x97, 0xc2, 0x97, 0x34, 0x9c, 0x55, 0xa4, 0x1c, 0xd4, 0xc7, 0x64, 0x13, 0x3a, 0xa0, 0xd7, 0xc3, 0xe7, 0x65, 0x9c, 0x2d, 0xd4, 0xd2, 0xf5, 0xc9, 0xd4}
+)
+
 func (c *controller) login(w http.ResponseWriter, r *http.Request) {
 	if !validateContentTypeJSON(w, r) {
 		return
@@ -199,20 +230,20 @@ func (c *controller) login(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		// Unknown account: run a real validation against the dummy hash so the
-		// response time matches a wrong-password check, then fail generically.
-		_ = argon2.Validate(request.Password, c.dummyHash, c.dummySalt)
-		w.WriteHeader(http.StatusUnauthorized)
-		return
+		// Unknown account: user stays zero, so the decoy is used below and the
+		// response is identical to a wrong password on a registered account.
 	}
 
-	if user.HashedPassword == nil {
-		_ = argon2.Validate(request.Password, c.dummyHash, c.dummySalt)
-		w.WriteHeader(http.StatusUnauthorized)
-		return
+	// Select the credential to derive against, then run that derivation once,
+	// whatever the outcome. The decoy covers an unknown account and an account
+	// with no stored credential (`hashed_password`/`salt` are nullable).
+	stored := err == nil && user.HashedPassword != nil && user.Salt != nil
+	hash, salt := decoyHash, decoySalt
+	if stored {
+		hash, salt = user.HashedPassword, user.Salt
 	}
 
-	if err := argon2.Validate(request.Password, user.HashedPassword, user.Salt); err != nil {
+	if argon2.Validate(request.Password, hash, salt) != nil || !stored {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}

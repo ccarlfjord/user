@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/ccarlfjord/argon2"
 	"github.com/ccarlfjord/user/internal/repository"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -54,13 +56,14 @@ func (f fakeStore) ActivateUser(ctx context.Context, id uuid.UUID) error {
 	return f.activateUser(ctx, id)
 }
 
+// testSessionKey is the HMAC key newTestController signs and validates
+// sessions with.
+const testSessionKey = "test-signing-key"
+
 func newTestController(store userStore) *controller {
-	salt := argon2.GenerateSalt()
 	return &controller{
 		db:           store,
-		sessionToken: []byte("test-signing-key"),
-		dummyHash:    argon2.HashPassword("", salt),
-		dummySalt:    salt,
+		sessionToken: []byte(testSessionKey),
 	}
 }
 
@@ -78,12 +81,14 @@ const genericSignupBody = `{"status":"ok"}`
 
 func TestCreateUserNewReturnsGenericCreated(t *testing.T) {
 	created := false
+	var stored repository.CreateUserParams
 	store := fakeStore{
 		getUserByEmail: func(context.Context, string) (repository.User, error) {
 			return repository.User{}, pgx.ErrNoRows
 		},
 		createUser: func(_ context.Context, arg repository.CreateUserParams) (repository.User, error) {
 			created = true
+			stored = arg
 			return repository.User{ID: arg.ID, Email: arg.Email, Active: arg.Active}, nil
 		},
 		createVerificationToken: func(context.Context, repository.CreateVerificationTokenParams) error {
@@ -103,6 +108,15 @@ func TestCreateUserNewReturnsGenericCreated(t *testing.T) {
 	}
 	if got := rec.Body.String(); got != genericSignupBody {
 		t.Fatalf("body = %q, want %q", got, genericSignupBody)
+	}
+	// The credential handed to the store must be the one the account logs in
+	// with: the hash is now derived before the email lookup, so it has to
+	// survive that reordering.
+	if err := argon2.Validate("password1", stored.HashedPassword, stored.Salt); err != nil {
+		t.Fatalf("stored credential does not validate the signup password: %v", err)
+	}
+	if len(stored.Salt) != 16 {
+		t.Fatalf("salt length = %d, want 16", len(stored.Salt))
 	}
 }
 
@@ -246,20 +260,90 @@ func TestLoginMalformedBodyReturnsBadRequest(t *testing.T) {
 	}
 }
 
+// A row can carry NULL credentials (the columns are nullable), and an active
+// account with none must not be loginable with any password.
+func TestLoginRejectsAccountsWithoutStoredCredentials(t *testing.T) {
+	salt := []byte("0123456789abcdef")
+	tests := []struct {
+		name string
+		user repository.User
+	}{
+		{"null hash", repository.User{HashedPassword: nil, Salt: salt}},
+		{"null salt", repository.User{HashedPassword: argon2.HashPassword("rightpassword", salt), Salt: nil}},
+		{"no credential at all", repository.User{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			user := tt.user
+			user.ID = uuid.New()
+			user.Active = true
+			c := newTestController(fakeStore{
+				getUserByEmail: func(context.Context, string) (repository.User, error) {
+					return user, nil
+				},
+			})
+
+			for _, password := range []string{"rightpassword", "password1", "", "decoy"} {
+				rec := doRequest(c.login, http.MethodPost, "/v1/login", "application/json",
+					`{"email":"a@b.com","password":"`+password+`"}`)
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("password %q: status = %d, want 401", password, rec.Code)
+				}
+				if bytes.Contains(rec.Body.Bytes(), []byte("session")) {
+					t.Fatalf("password %q: response carried a session", password)
+				}
+			}
+		})
+	}
+}
+
+func TestLoginRejectsUnverifiedAccount(t *testing.T) {
+	salt := []byte("0123456789abcdef")
+	c := newTestController(fakeStore{
+		getUserByEmail: func(context.Context, string) (repository.User, error) {
+			return repository.User{
+				ID:             uuid.New(),
+				HashedPassword: argon2.HashPassword("rightpassword", salt),
+				Salt:           salt,
+				Active:         false,
+			}, nil
+		},
+	})
+
+	rec := doRequest(c.login, http.MethodPost, "/v1/login", "application/json",
+		`{"email":"a@b.com","password":"rightpassword"}`)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte("session")) {
+		t.Fatal("response carried a session for an unverified account")
+	}
+}
+
 func TestGetUserByIDNotFound(t *testing.T) {
+	admin := activeUser(true)
 	store := fakeStore{
-		getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+		getUserById: func(_ context.Context, id uuid.UUID) (repository.User, error) {
+			if id == admin.ID {
+				return admin, nil
+			}
 			return repository.User{}, pgx.ErrNoRows
 		},
 	}
 	c := newTestController(store)
 
+	// Unknown id: authorized (admin) but the row does not exist.
 	missing := httptest.NewRecorder()
-	missingReq := httptest.NewRequest(http.MethodGet, "/v1/user/"+uuid.New().String(), nil)
+	missingReq := authRequest(t, http.MethodGet, "/v1/user/"+uuid.New().String(), admin.ID.String())
 	missingReq.SetPathValue("id", uuid.New().String())
-	c.getUserByID(missing, missingReq)
+	c.userByIDHandler(missing, missingReq)
 
-	invalid := doRequest(c.getUserByID, http.MethodGet, "/v1/user/not-a-uuid", "", "")
+	// Unparseable id: rejected before any lookup or authorization.
+	invalidReq := authRequest(t, http.MethodGet, "/v1/user/not-a-uuid", admin.ID.String())
+	invalid := httptest.NewRecorder()
+	c.userByIDHandler(invalid, invalidReq)
 
 	if missing.Code != http.StatusNotFound || invalid.Code != http.StatusNotFound {
 		t.Fatalf("status = %d and %d, want 404", missing.Code, invalid.Code)
@@ -323,5 +407,304 @@ func TestVerifyRejectsInvalidOrExpiredToken(t *testing.T) {
 	expired := doRequest(newTestController(expiredStore).verify, http.MethodGet, "/v1/verify?token=old", "", "")
 	if expired.Code != http.StatusBadRequest {
 		t.Fatalf("expired token status = %d, want 400", expired.Code)
+	}
+}
+
+// signSession issues a token the way login does.
+func signSession(t *testing.T, key []byte, sub string, expiresAt *time.Time) string {
+	t.Helper()
+
+	claims := jwt.RegisteredClaims{Subject: sub}
+	if expiresAt != nil {
+		claims.ExpiresAt = jwt.NewNumericDate(*expiresAt)
+	}
+
+	signed, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(key)
+	if err != nil {
+		t.Fatalf("sign session: %v", err)
+	}
+	return signed
+}
+
+// authRequest returns a request carrying a valid session token for sub.
+func authRequest(t *testing.T, method, target, sub string) *http.Request {
+	t.Helper()
+
+	inAnHour := time.Now().Add(time.Hour)
+	req := httptest.NewRequest(method, target, nil)
+	req.Header.Set("Authorization", "Bearer "+signSession(t, []byte(testSessionKey), sub, &inAnHour))
+	return req
+}
+
+// activeUser is a live account that a session subject can resolve to.
+func activeUser(admin bool) repository.User {
+	return repository.User{ID: uuid.New(), Email: "caller@example.com", Active: true, Admin: admin}
+}
+
+func TestRequireSessionRejectsInvalidTokens(t *testing.T) {
+	c := newTestController(fakeStore{})
+	key := []byte(testSessionKey)
+	inAnHour := time.Now().Add(time.Hour)
+	sub := uuid.New().String()
+
+	// Same key, different algorithm: must not be accepted even though the
+	// signature would verify under a non-pinned HMAC check.
+	hs512 := func() string {
+		token := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.RegisteredClaims{
+			Subject:   sub,
+			ExpiresAt: jwt.NewNumericDate(inAnHour),
+		})
+		signed, err := token.SignedString(key)
+		if err != nil {
+			t.Fatalf("sign hs512 token: %v", err)
+		}
+		return signed
+	}()
+
+	none := func() string {
+		token := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.RegisteredClaims{
+			Subject:   sub,
+			ExpiresAt: jwt.NewNumericDate(inAnHour),
+		})
+		signed, err := token.SignedString(jwt.UnsafeAllowNoneSignatureType)
+		if err != nil {
+			t.Fatalf("sign none token: %v", err)
+		}
+		return signed
+	}()
+
+	expired := time.Now().Add(-time.Minute)
+	tests := []struct {
+		name   string
+		header string
+	}{
+		{"missing header", ""},
+		{"scheme without token", "Bearer"},
+		{"wrong scheme", "Basic " + signSession(t, key, sub, &inAnHour)},
+		{"malformed token", "Bearer not-a-jwt"},
+		{"signed with another key", "Bearer " + signSession(t, []byte("other-signing-key"), sub, &inAnHour)},
+		{"expired", "Bearer " + signSession(t, key, sub, &expired)},
+		{"no expiry", "Bearer " + signSession(t, key, sub, nil)},
+		{"hs512", "Bearer " + hs512},
+		{"alg none", "Bearer " + none},
+		{"empty subject", "Bearer " + signSession(t, key, "", &inAnHour)},
+		{"subject is not a user id", "Bearer " + signSession(t, key, "not-a-uuid", &inAnHour)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			handler := c.requireSession(func(http.ResponseWriter, *http.Request) { called = true })
+
+			req := httptest.NewRequest(http.MethodGet, "/v1/user/"+uuid.New().String(), nil)
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			rec := httptest.NewRecorder()
+			handler(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rec.Code)
+			}
+			if called {
+				t.Fatal("handler ran for a rejected session")
+			}
+		})
+	}
+}
+
+func TestRequireSessionAcceptsValidToken(t *testing.T) {
+	caller := activeUser(false)
+	c := newTestController(fakeStore{
+		getUserById: func(_ context.Context, id uuid.UUID) (repository.User, error) {
+			if id != caller.ID {
+				t.Fatalf("looked up %s, want the session subject %s", id, caller.ID)
+			}
+			return caller, nil
+		},
+	})
+
+	var got repository.User
+	called := false
+	handler := c.requireSession(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		got, _ = callerFrom(r.Context())
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	rec := httptest.NewRecorder()
+	handler(rec, authRequest(t, http.MethodGet, "/v1/user/"+caller.ID.String(), caller.ID.String()))
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	if !called {
+		t.Fatal("handler did not run for a valid session")
+	}
+	if got.ID != caller.ID {
+		t.Fatalf("caller in context = %s, want %s", got.ID, caller.ID)
+	}
+}
+
+func TestRequireSessionRejectsUnresolvableCaller(t *testing.T) {
+	caller := activeUser(false)
+	inactive := caller
+	inactive.Active = false
+
+	tests := []struct {
+		name  string
+		store fakeStore
+		want  int
+	}{
+		{
+			name: "deleted account",
+			store: fakeStore{
+				getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+					return repository.User{}, pgx.ErrNoRows
+				},
+			},
+			want: http.StatusUnauthorized,
+		},
+		{
+			name: "deactivated account",
+			store: fakeStore{
+				getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+					return inactive, nil
+				},
+			},
+			want: http.StatusUnauthorized,
+		},
+		{
+			name: "lookup failure",
+			store: fakeStore{
+				getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+					return repository.User{}, errors.New("connection reset")
+				},
+			},
+			want: http.StatusInternalServerError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			handler := newTestController(tt.store).requireSession(func(http.ResponseWriter, *http.Request) { called = true })
+
+			rec := httptest.NewRecorder()
+			handler(rec, authRequest(t, http.MethodGet, "/v1/user/"+caller.ID.String(), caller.ID.String()))
+
+			if rec.Code != tt.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.want)
+			}
+			if called {
+				t.Fatal("handler ran for an unresolvable caller")
+			}
+		})
+	}
+}
+
+func TestProtectedRoutesRequireSession(t *testing.T) {
+	caller := activeUser(false)
+	store := fakeStore{
+		getUserById: func(_ context.Context, id uuid.UUID) (repository.User, error) {
+			return repository.User{ID: id, Email: "a@b.com", Active: true}, nil
+		},
+	}
+	c := newTestController(store)
+
+	protected := []struct {
+		name    string
+		handler http.HandlerFunc
+		method  string
+		target  string
+	}{
+		{"get user by id", c.userByIDHandler, http.MethodGet, "/v1/user/" + caller.ID.String()},
+		{"delete user", c.userHandler, http.MethodDelete, "/v1/user"},
+		{"update user", c.userHandler, http.MethodPatch, "/v1/user"},
+	}
+
+	for _, tt := range protected {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := doRequest(tt.handler, tt.method, tt.target, "", "")
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rec.Code)
+			}
+		})
+	}
+
+	// Sign up stays public: the gate must not turn a bad request into a 401.
+	t.Run("create user stays public", func(t *testing.T) {
+		rec := doRequest(c.userHandler, http.MethodPost, "/v1/user", "text/plain", `{}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", rec.Code)
+		}
+	})
+
+	// A valid session reaches the handler instead of being short-circuited.
+	t.Run("valid session reaches handler", func(t *testing.T) {
+		req := authRequest(t, http.MethodGet, "/v1/user/"+caller.ID.String(), caller.ID.String())
+		req.SetPathValue("id", caller.ID.String())
+		rec := httptest.NewRecorder()
+
+		c.userByIDHandler(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		var got User
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if got.ID != caller.ID {
+			t.Fatalf("id = %s, want %s", got.ID, caller.ID)
+		}
+	})
+}
+
+func TestGetUserByIDRequiresSelfOrAdmin(t *testing.T) {
+	caller := activeUser(false)
+	admin := activeUser(true)
+	other := repository.User{ID: uuid.New(), Email: "other@example.com", Active: true}
+
+	store := fakeStore{
+		getUserById: func(_ context.Context, id uuid.UUID) (repository.User, error) {
+			for _, u := range []repository.User{caller, admin, other} {
+				if u.ID == id {
+					return u, nil
+				}
+			}
+			return repository.User{}, pgx.ErrNoRows
+		},
+	}
+
+	tests := []struct {
+		name   string
+		caller repository.User
+		target uuid.UUID
+		want   int
+	}{
+		{"self", caller, caller.ID, http.StatusOK},
+		{"admin reading another user", admin, other.ID, http.StatusOK},
+		{"non-admin reading another user", caller, other.ID, http.StatusForbidden},
+		{"non-admin probing an unknown id", caller, uuid.New(), http.StatusForbidden},
+		{"admin probing an unknown id", admin, uuid.New(), http.StatusNotFound},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTestController(store)
+			req := authRequest(t, http.MethodGet, "/v1/user/"+tt.target.String(), tt.caller.ID.String())
+			req.SetPathValue("id", tt.target.String())
+			rec := httptest.NewRecorder()
+
+			c.userByIDHandler(rec, req)
+
+			if rec.Code != tt.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.want)
+			}
+			if tt.want != http.StatusOK && rec.Body.Len() != 0 {
+				t.Fatalf("denied response leaked a body: %q", rec.Body.String())
+			}
+		})
 	}
 }

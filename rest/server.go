@@ -3,11 +3,14 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 
-	"github.com/ccarlfjord/argon2"
 	"github.com/ccarlfjord/user/internal/repository"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -27,8 +30,6 @@ type userStore interface {
 type controller struct {
 	db           userStore
 	sessionToken []byte
-	dummyHash    []byte
-	dummySalt    []byte
 }
 
 type User struct {
@@ -39,18 +40,9 @@ type User struct {
 }
 
 func New(conn *pgx.Conn, sessionToken []byte) *controller {
-	db := repository.New(conn)
-
-	// A fixed dummy hash lets login run a real (slow) validation even when the
-	// account does not exist, so response timing does not reveal account
-	// existence.
-	dummySalt := argon2.GenerateSalt()
-
 	return &controller{
-		db:           db,
+		db:           repository.New(conn),
 		sessionToken: sessionToken,
-		dummyHash:    argon2.HashPassword("", dummySalt),
-		dummySalt:    dummySalt,
 	}
 }
 
@@ -95,9 +87,9 @@ func (c *controller) userHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		c.createUser(w, r)
 	case http.MethodDelete:
-		c.deleteUser(w, r)
+		c.requireSession(c.deleteUser)(w, r)
 	case http.MethodPatch:
-		c.updateUser(w, r)
+		c.requireSession(c.updateUser)(w, r)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		w.Write([]byte("Method not allowed"))
@@ -107,11 +99,105 @@ func (c *controller) userHandler(w http.ResponseWriter, r *http.Request) {
 func (c *controller) userByIDHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		c.getUserByID(w, r)
+		c.requireSession(c.getUserByID)(w, r)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		w.Write([]byte("Method not allowed"))
 	}
+}
+
+// requireSession rejects requests without a valid session token in the
+// Authorization header, then resolves the token's subject to a live, active
+// account and attaches it to the request context. Authorization — who may act
+// on which user — is left to the wrapped handler, which reads the caller with
+// callerFrom.
+func (c *controller) requireSession(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		raw, ok := bearerToken(r.Header.Get("Authorization"))
+		if !ok {
+			unauthorized(w)
+			return
+		}
+
+		claims := new(jwt.RegisteredClaims)
+		_, err := jwt.ParseWithClaims(raw, claims, c.sessionKey,
+			jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+			jwt.WithExpirationRequired(),
+		)
+		if err != nil {
+			slog.Debug("rejected session token", "error", err)
+			unauthorized(w)
+			return
+		}
+
+		userID, err := uuid.Parse(claims.Subject)
+		if err != nil {
+			slog.Debug("session subject is not a user id", "subject", claims.Subject)
+			unauthorized(w)
+			return
+		}
+
+		// Resolve the subject on every request: a deleted or deactivated
+		// account must not keep using a token that has not expired yet, and
+		// handlers need the caller's admin flag to authorize the target.
+		caller, err := c.db.GetUserById(r.Context(), userID)
+		if err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				slog.Error(err.Error())
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			unauthorized(w)
+			return
+		}
+		if !caller.Active {
+			unauthorized(w)
+			return
+		}
+
+		next(w, r.WithContext(context.WithValue(r.Context(), callerKey{}, caller)))
+	}
+}
+
+// callerKey is the request context key under which requireSession stores the
+// authenticated user.
+type callerKey struct{}
+
+// callerFrom returns the user attached to the request by requireSession.
+func callerFrom(ctx context.Context) (repository.User, bool) {
+	caller, ok := ctx.Value(callerKey{}).(repository.User)
+	return caller, ok
+}
+
+// mayAccessUser reports whether caller may read or modify the account
+// identified by target: admins may act on anyone, everyone else only on
+// themselves.
+func mayAccessUser(caller repository.User, target uuid.UUID) bool {
+	return caller.Admin || caller.ID == target
+}
+
+// sessionKey returns the HMAC secret only for HS256 tokens. The signing method
+// is pinned so a token cannot be verified with an algorithm the caller chose
+// (alg confusion / "none").
+func (c *controller) sessionKey(t *jwt.Token) (any, error) {
+	if m, ok := t.Method.(*jwt.SigningMethodHMAC); !ok || m.Alg() != jwt.SigningMethodHS256.Alg() {
+		return nil, fmt.Errorf("unexpected signing method %q", t.Method.Alg())
+	}
+	return c.sessionToken, nil
+}
+
+// bearerToken extracts the token from an Authorization header value.
+func bearerToken(header string) (string, bool) {
+	scheme, token, ok := strings.Cut(header, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" {
+		return "", false
+	}
+	return token, true
+}
+
+func unauthorized(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	w.WriteHeader(http.StatusUnauthorized)
 }
 
 func validateContentTypeJSON(w http.ResponseWriter, r *http.Request) bool {
