@@ -1,4 +1,4 @@
-module github.com/ccarlfjord/user-service
+module github.com/ccarlfjord/user
 
 go 1.22
 

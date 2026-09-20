@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/ccarlfjord/user-service/internal/repository"
+	"github.com/ccarlfjord/user/internal/repository"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -82,7 +82,7 @@ func validateContentTypeJSON(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func JSON(w http.ResponseWriter, status int, body interface{}) {
+func JSON(w http.ResponseWriter, status int, body any) {
 	json, err := json.Marshal(body)
 	if err != nil {
 		slog.Error(err.Error())

@@ -9,8 +9,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/ccarlfjord/user-service/argon2"
-	"github.com/ccarlfjord/user-service/repository"
+	"github.com/ccarlfjord/user/argon2"
+	"github.com/ccarlfjord/user/internal/repository"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )

@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/ccarlfjord/user-service/rest"
+	"github.com/ccarlfjord/user/rest"
 	"github.com/jackc/pgx/v5"
 )
 
