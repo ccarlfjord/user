@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign up</title>
+</head>
+<body>
+  <h1>Sign up</h1>
+  <form id="signup-form">
+    <p><label>Email <input type="email" name="email" required></label></p>
+    <p><label>Password <input type="password" name="password" minlength="8" required></label></p>
+    <button type="submit">Create account</button>
+  </form>
+  <p id="message"></p>
+
+  <script>
+    const form = document.getElementById('signup-form');
+    const message = document.getElementById('message');
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      message.textContent = '';
+
+      const data = Object.fromEntries(new FormData(form));
+
+      try {
+        const res = await fetch('/v1/user', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data),
+        });
+
+        if (res.status === 201) {
+          message.textContent = 'Request received. Check the server console for the verification link.';
+          form.reset();
+          return;
+        }
+
+        message.textContent = 'Sign up failed (' + res.status + ').';
+      } catch (err) {
+        message.textContent = 'Network error: ' + err.message;
+      }
+    });
+  </script>
+</body>
+</html>

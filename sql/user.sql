@@ -26,7 +26,7 @@ UPDATE users SET admin = TRUE WHERE id = $1;
 UPDATE users SET admin = FALSE WHERE id = $1;
 
 -- name: CreateUser :one
-INSERT INTO users(id, username, email, hashed_password, salt, active, admin) VALUES( $1, $2, $3, $4, $5, $6, $7)
+INSERT INTO users(id, email, hashed_password, salt, active, admin) VALUES( $1, $2, $3, $4, $5, $6)
 RETURNING *;
 
 -- name: UpdateUser :one

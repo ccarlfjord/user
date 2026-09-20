@@ -4,12 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
-	"errors"
-	"log"
 	"os"
 	"testing"
 
-	"github.com/ccarlfjord/user/argon2"
+	"github.com/ccarlfjord/argon2"
 	"github.com/ccarlfjord/user/internal/repository"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -24,50 +22,47 @@ func TestCreateUser(t *testing.T) {
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, connString)
 	if err != nil {
-		log.Fatal(err)
+		t.Fatal(err)
 	}
+	defer conn.Close(ctx)
+
 	salt := make([]byte, 16)
 	rand.Read(salt)
 	db := repository.New(conn)
-	// Check if user exists
-	pass := argon2.NewDefaultArgon2()
-	user, err := db.GetUserByEmail(ctx, "test@example.com")
-	if errors.Is(err, pgx.ErrNoRows) {
-		user, err = db.CreateUser(ctx, repository.CreateUserParams{
-			ID:             uuid.New(),
-			Username:       "test",
-			Email:          "test@example.com",
-			HashedPassword: pass.Hash("test123", salt),
-			Salt:           salt,
-			Active:         true,
-			Admin:          true,
-		})
-		if err != nil {
-			log.Println(err)
+
+	// Start from a clean slate so a manually created account does not affect
+	// the test.
+	if existing, err := db.GetUserByEmail(ctx, "test@example.com"); err == nil {
+		if err := db.DeleteUser(ctx, existing.ID); err != nil {
+			t.Fatal(err)
 		}
 	}
+
+	pass := argon2.NewDefaultArgon2id()
+	user, err := db.CreateUser(ctx, repository.CreateUserParams{
+		ID:             uuid.New(),
+		Email:          "test@example.com",
+		HashedPassword: pass.Hash("test123", salt),
+		Salt:           salt,
+		Active:         true,
+		Admin:          true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer func() {
-		deleteUser(t, db, user.Email)
+		if err := db.DeleteUser(ctx, user.ID); err != nil {
+			t.Error(err)
+		}
 	}()
-	json, _ := json.Marshal(user)
-	t.Log(string(json))
+
+	b, _ := json.Marshal(user)
+	t.Log(string(b))
+
 	if err := db.ActivateUser(ctx, user.ID); err != nil {
 		t.Error(err)
 	}
-	if err := pass.Validate("test123", user.HashedPassword, user.Salt); err == nil {
-		t.Log("Password is valid")
-	} else {
-		t.Error(err)
-	}
-}
-
-func deleteUser(t *testing.T, db *repository.Queries, email string) {
-	ctx := context.Background()
-	user, err := db.GetUserByEmail(ctx, email)
-	if err != nil {
-		t.Error(err)
-	}
-	if err := db.DeleteUser(ctx, user.ID); err != nil {
+	if err := pass.Validate("test123", user.HashedPassword, user.Salt); err != nil {
 		t.Error(err)
 	}
 }
