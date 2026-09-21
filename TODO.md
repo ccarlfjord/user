@@ -78,9 +78,22 @@ Ordered by priority; every item is grounded in the code as it stands.
       (more than one instance may serve a request) and JWT date claims have one-second resolution: a timestamp
       version rejected sessions minted in the same second as the change, which the live smoke test caught.
       Deploying this ends every session in circulation — old tokens carry no `aud`/`epoch` and fail parsing.
-- [ ] Still open on sessions: no `jti`, so there is no logout endpoint and no per-session revocation — bumping
-      `session_epoch` is only the whole-account version of that; no refresh path, and tokens stay 1h with no
-      rotation.
+- [x] Refresh tokens. `POST /v1/login` answers `SessionResponse{session, refresh}`: the session is the 1h JWT
+      above (`sessionTTL`), the refresh token is a 256-bit random value good for 30 days (`refreshTokenTTL`),
+      stored only as a SHA-256 hash in `refresh_tokens` (migration `000005_refresh_tokens`, reversible) with the
+      account's `session_epoch` at issue. `POST /v1/refresh` takes `{"refresh":"..."}` and exchanges it. The
+      exchange is one `DELETE ... RETURNING` (`ConsumeRefreshToken`), so the token is consumed exactly once even under
+      concurrent requests, and each exchange mints a fresh session and a fresh refresh token (rotation) — a copy
+      that leaked cannot be replayed once the legitimate client uses the original. The row's `session_epoch` is
+      compared against the account's current one, so a password change retires refresh tokens minted before it
+      exactly as it retires sessions; deleting an account takes its tokens via `ON DELETE CASCADE`, and an
+      inactive account cannot refresh. A refresh token outlives the session, which is the point: a client that
+      was away for hours refreshes from the older session instead of logging in again. Tests in
+      `rest/user_test.go` cover issuance, rotation, and every rejection path.
+- [ ] Still open on sessions: no `jti`, so there is no logout endpoint and no per-session revocation of a live
+      session — bumping `session_epoch` is only the whole-account version of that; spending a refresh token cuts
+      off the refresh path but a session already minted lives out its hour. Retired or expired `refresh_tokens`
+      rows are only removed when presented, so they accumulate until one is; no janitor yet.
 
 ## P1 — schema and repository
 

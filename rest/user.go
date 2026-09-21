@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -29,6 +30,16 @@ const (
 	sessionIssuer   = "ccarlfjord/user"
 	sessionAudience = "user-api"
 )
+
+// sessionTTL is how long a minted session stays usable on its own. It is
+// deliberately short: the refresh token is what carries a client across a
+// longer absence, and every refresh re-checks the account's state.
+const sessionTTL = 1 * time.Hour
+
+// refreshTokenTTL is how long a refresh token stays usable. It is much longer
+// than a session so a client that was away for hours or days can still come
+// back, and it is the only thing that outlives the session.
+const refreshTokenTTL = 30 * 24 * time.Hour
 
 // sessionClaims is what a session token carries. The registered claims say who
 // it is for and when it dies; SessionEpoch ties it to the account's current
@@ -187,7 +198,7 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 
 	// No email provider is configured yet, so the verification link is logged
 	// to the console instead of being sent. Only the token hash is stored.
-	token, err := generateVerificationToken()
+	token, err := generateToken()
 	if err != nil {
 		slog.Error(err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
@@ -434,8 +445,17 @@ type LoginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 }
-type LoginResponse struct {
+
+// SessionResponse is what a login or a refresh answers with: a short-lived
+// session and the longer-lived refresh token that mints the next one.
+type SessionResponse struct {
 	Session string `json:"session"`
+	Refresh string `json:"refresh"`
+}
+
+// refreshRequest presents a refresh token for exchange.
+type refreshRequest struct {
+	Refresh string `json:"refresh"`
 }
 
 // decoySalt and decoyHash stand in when there is no stored credential to check
@@ -489,6 +509,30 @@ func (c *controller) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sessionToken, err := c.mintSession(user)
+	if err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	refreshToken, err := c.issueRefreshToken(r.Context(), user)
+	if err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	JSON(w, http.StatusOK, SessionResponse{
+		Session: sessionToken,
+		Refresh: refreshToken,
+	})
+}
+
+// mintSession signs a session token for user at the generation the account is
+// in now. Every mint — fresh login or refresh — reads the current epoch, so a
+// token handed out here is already retired if the password changes afterwards.
+func (c *controller) mintSession(user repository.User) (string, error) {
 	now := time.Now()
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, sessionClaims{
@@ -496,21 +540,113 @@ func (c *controller) login(w http.ResponseWriter, r *http.Request) {
 			Issuer:    sessionIssuer,
 			Subject:   user.ID.String(),
 			Audience:  jwt.ClaimStrings{sessionAudience},
-			ExpiresAt: jwt.NewNumericDate(now.Add(1 * time.Hour)),
+			ExpiresAt: jwt.NewNumericDate(now.Add(sessionTTL)),
 			IssuedAt:  jwt.NewNumericDate(now),
 		},
 		SessionEpoch: &user.SessionEpoch,
 	})
 
-	sessionToken, err := token.SignedString(c.sessionToken)
+	return token.SignedString(c.sessionToken)
+}
+
+// issueRefreshToken stores a new refresh token for user and returns the value
+// to hand to the client. Only the hash is persisted; the token itself exists
+// just in the response. It carries the account's current session generation
+// so a password change retires it along with every session.
+func (c *controller) issueRefreshToken(ctx context.Context, user repository.User) (string, error) {
+	token, err := generateToken()
+	if err != nil {
+		return "", err
+	}
+
+	err = c.db.CreateRefreshToken(ctx, repository.CreateRefreshTokenParams{
+		TokenHash:    hashToken(token),
+		UserID:       user.ID,
+		SessionEpoch: user.SessionEpoch,
+		ExpiresAt:    time.Now().Add(refreshTokenTTL),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return token, nil
+}
+
+// refresh exchanges a refresh token for a new session and a new refresh token.
+// The presented token is consumed — rotation means a copy that leaked cannot be
+// replayed after the legitimate client has used the real one. A token whose
+// generation no longer matches the account's is refused, which is how a
+// password change retires refresh tokens minted before it.
+func (c *controller) refresh(w http.ResponseWriter, r *http.Request) {
+	if !validateContentTypeJSON(w, r) {
+		return
+	}
+
+	var req refreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Refresh == "" {
+		PlainText(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+
+	tokenHash := hashToken(req.Refresh)
+
+	// Consuming the token is the lookup: a single delete that returns the row, so
+	// two concurrent refreshes with the same value cannot both succeed. A token
+	// that is found is gone whether or not the rest of the request goes on to
+	// mint a replacement.
+	stored, err := c.db.ConsumeRefreshToken(r.Context(), tokenHash)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error(err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		unauthorized(w)
+		return
+	}
+
+	if stored.ExpiresAt.Before(time.Now()) {
+		unauthorized(w)
+		return
+	}
+
+	user, err := c.db.GetUserById(r.Context(), stored.UserID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error(err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		// The account is gone; the cascade should have removed the token, so
+		// this is only reachable if the row outlived its user.
+		unauthorized(w)
+		return
+	}
+
+	if !user.Active || stored.SessionEpoch != user.SessionEpoch {
+		slog.Debug("rejected refresh token from a retired session generation",
+			"subject", user.ID, "epoch", stored.SessionEpoch, "current", user.SessionEpoch)
+		unauthorized(w)
+		return
+	}
+
+	sessionToken, err := c.mintSession(user)
 	if err != nil {
 		slog.Error(err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	JSON(w, http.StatusOK, LoginResponse{
+	refreshToken, err := c.issueRefreshToken(r.Context(), user)
+	if err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	JSON(w, http.StatusOK, SessionResponse{
 		Session: sessionToken,
+		Refresh: refreshToken,
 	})
 }
 
@@ -563,7 +699,10 @@ func (c *controller) verify(w http.ResponseWriter, r *http.Request) {
 	PlainText(w, http.StatusOK, "Account verified. You can now log in.")
 }
 
-func generateVerificationToken() (string, error) {
+// generateToken returns a 256-bit random token, hex encoded. It is used for
+// both verification and refresh tokens; only the stored hash ever matters to
+// the server.
+func generateToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -571,7 +710,7 @@ func generateVerificationToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// hashToken returns the SHA-256 hash stored for a verification token. Only the
+// hashToken returns the SHA-256 hash stored for a bearer-style token. Only the
 // hash is persisted, so a database leak does not expose usable tokens.
 func hashToken(token string) []byte {
 	sum := sha256.Sum256([]byte(token))

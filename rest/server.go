@@ -27,6 +27,8 @@ type userStore interface {
 	ActivateUser(ctx context.Context, id uuid.UUID) error
 	UpdateUser(ctx context.Context, arg repository.UpdateUserParams) (repository.User, error)
 	DeleteUser(ctx context.Context, id uuid.UUID) (int64, error)
+	CreateRefreshToken(ctx context.Context, arg repository.CreateRefreshTokenParams) error
+	ConsumeRefreshToken(ctx context.Context, tokenHash []byte) (repository.RefreshToken, error)
 }
 
 type controller struct {
@@ -54,6 +56,7 @@ func (c *controller) Run() error {
 	r.HandleFunc("/v1/user", c.userHandler)
 	r.HandleFunc("/v1/user/{id}", c.userByIDHandler)
 	r.HandleFunc("/v1/login", c.loginHandler)
+	r.HandleFunc("/v1/refresh", c.refreshHandler)
 	r.HandleFunc("/v1/verify", c.verifyHandler)
 	r.HandleFunc("/signup", c.signupPage)
 
@@ -78,6 +81,16 @@ func (c *controller) loginHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		c.login(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte("Method not allowed"))
+	}
+}
+
+func (c *controller) refreshHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		c.refresh(w, r)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		w.Write([]byte("Method not allowed"))

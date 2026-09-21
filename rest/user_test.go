@@ -30,6 +30,8 @@ type fakeStore struct {
 	activateUser                    func(context.Context, uuid.UUID) error
 	updateUser                      func(context.Context, repository.UpdateUserParams) (repository.User, error)
 	deleteUser                      func(context.Context, uuid.UUID) (int64, error)
+	createRefreshToken              func(context.Context, repository.CreateRefreshTokenParams) error
+	consumeRefreshToken             func(context.Context, []byte) (repository.RefreshToken, error)
 }
 
 func (f fakeStore) GetUserByEmail(ctx context.Context, email string) (repository.User, error) {
@@ -66,6 +68,14 @@ func (f fakeStore) UpdateUser(ctx context.Context, arg repository.UpdateUserPara
 
 func (f fakeStore) DeleteUser(ctx context.Context, id uuid.UUID) (int64, error) {
 	return f.deleteUser(ctx, id)
+}
+
+func (f fakeStore) CreateRefreshToken(ctx context.Context, arg repository.CreateRefreshTokenParams) error {
+	return f.createRefreshToken(ctx, arg)
+}
+
+func (f fakeStore) ConsumeRefreshToken(ctx context.Context, tokenHash []byte) (repository.RefreshToken, error) {
+	return f.consumeRefreshToken(ctx, tokenHash)
 }
 
 // testSessionKey is the HMAC key newTestController signs and validates
@@ -235,16 +245,25 @@ func TestLoginFailuresAreIndistinguishable(t *testing.T) {
 	}
 }
 
-func TestLoginSuccessReturnsSession(t *testing.T) {
+func TestLoginReturnsSessionAndRefreshToken(t *testing.T) {
 	salt := []byte("0123456789abcdef")
+	user := repository.User{
+		ID:             uuid.New(),
+		Email:          "known@example.com",
+		HashedPassword: argon2.HashPassword("rightpassword", salt),
+		Salt:           salt,
+		Active:         true,
+		SessionEpoch:   4,
+	}
+
+	var stored repository.CreateRefreshTokenParams
 	store := fakeStore{
 		getUserByEmail: func(context.Context, string) (repository.User, error) {
-			return repository.User{
-				ID:             uuid.New(),
-				HashedPassword: argon2.HashPassword("rightpassword", salt),
-				Salt:           salt,
-				Active:         true,
-			}, nil
+			return user, nil
+		},
+		createRefreshToken: func(_ context.Context, arg repository.CreateRefreshTokenParams) error {
+			stored = arg
+			return nil
 		},
 	}
 	c := newTestController(store)
@@ -255,12 +274,311 @@ func TestLoginSuccessReturnsSession(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	var resp LoginResponse
+	var resp SessionResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	if resp.Session == "" {
 		t.Fatal("expected a session token")
+	}
+	if resp.Refresh == "" {
+		t.Fatal("expected a refresh token")
+	}
+	// The value handed to the client has to be the one whose hash was stored,
+	// at the account's current generation and with the refresh lifetime.
+	if !bytes.Equal(stored.TokenHash, hashToken(resp.Refresh)) {
+		t.Fatal("stored hash does not match the returned refresh token")
+	}
+	if stored.UserID != user.ID || stored.SessionEpoch != user.SessionEpoch {
+		t.Fatalf("stored refresh token names %s at epoch %d, want %s at %d",
+			stored.UserID, stored.SessionEpoch, user.ID, user.SessionEpoch)
+	}
+	if !stored.ExpiresAt.After(time.Now().Add(refreshTokenTTL - time.Hour)) {
+		t.Fatalf("refresh token expires %s, want about %s out", stored.ExpiresAt, refreshTokenTTL)
+	}
+}
+
+func TestRefreshRotatesTokenAndMintsSession(t *testing.T) {
+	user := activeUser(false)
+	user.SessionEpoch = 2
+	old := "refresh-token-from-the-old-session"
+
+	var consumed []byte
+	var created repository.CreateRefreshTokenParams
+	store := fakeStore{
+		consumeRefreshToken: func(_ context.Context, tokenHash []byte) (repository.RefreshToken, error) {
+			if !bytes.Equal(tokenHash, hashToken(old)) {
+				t.Fatalf("consumed hash %x, want the presented token's", tokenHash)
+			}
+			consumed = tokenHash
+			return repository.RefreshToken{
+				TokenHash:    tokenHash,
+				UserID:       user.ID,
+				SessionEpoch: user.SessionEpoch,
+				ExpiresAt:    time.Now().Add(time.Hour),
+			}, nil
+		},
+		getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+			return user, nil
+		},
+		createRefreshToken: func(_ context.Context, arg repository.CreateRefreshTokenParams) error {
+			created = arg
+			return nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := doRequest(c.refresh, http.MethodPost, "/v1/refresh", "application/json",
+		`{"refresh":"`+old+`"}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var resp SessionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Session == "" || resp.Refresh == "" {
+		t.Fatalf("response = %+v, want a session and a refresh token", resp)
+	}
+	if !bytes.Equal(consumed, hashToken(old)) {
+		t.Fatal("the presented refresh token was not consumed")
+	}
+	if !bytes.Equal(created.TokenHash, hashToken(resp.Refresh)) {
+		t.Fatal("the returned refresh token's hash was not the one stored")
+	}
+	if bytes.Equal(created.TokenHash, hashToken(old)) {
+		t.Fatal("rotation handed back the token it just consumed")
+	}
+	if created.UserID != user.ID || created.SessionEpoch != user.SessionEpoch {
+		t.Fatalf("rotated token names %s at epoch %d, want %s at %d",
+			created.UserID, created.SessionEpoch, user.ID, user.SessionEpoch)
+	}
+
+	// The session minted from the old refresh token has to be usable as-is.
+	claims := new(sessionClaims)
+	if _, err := jwt.ParseWithClaims(resp.Session, claims, c.sessionKey,
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer(sessionIssuer),
+		jwt.WithAudience(sessionAudience),
+	); err != nil {
+		t.Fatalf("refreshed session does not parse: %v", err)
+	}
+	if claims.SessionEpoch == nil || *claims.SessionEpoch != user.SessionEpoch {
+		t.Fatalf("refreshed session epoch = %v, want %d", claims.SessionEpoch, user.SessionEpoch)
+	}
+}
+
+// A refresh token minted before a password change must stop working, so that
+// resetting a password really does end every session in circulation.
+func TestPasswordChangeRetiresRefreshTokens(t *testing.T) {
+	salt := []byte("0123456789abcdef")
+	caller := activeUser(false)
+	caller.HashedPassword = argon2.HashPassword("oldpassword", salt)
+	caller.Salt = salt
+
+	old := "refresh-token-minted-before-the-change"
+	current := caller
+	store := fakeStore{
+		getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+			return current, nil
+		},
+		updateUser: func(_ context.Context, arg repository.UpdateUserParams) (repository.User, error) {
+			current = repository.User{
+				ID:             arg.ID,
+				Email:          arg.Email,
+				HashedPassword: arg.HashedPassword,
+				Salt:           arg.Salt,
+				Active:         arg.Active,
+				Admin:          arg.Admin,
+				SessionEpoch:   arg.SessionEpoch,
+			}
+			return current, nil
+		},
+		consumeRefreshToken: func(context.Context, []byte) (repository.RefreshToken, error) {
+			return repository.RefreshToken{
+				TokenHash:    hashToken(old),
+				UserID:       caller.ID,
+				SessionEpoch: caller.SessionEpoch,
+				ExpiresAt:    time.Now().Add(time.Hour),
+			}, nil
+		},
+		createRefreshToken: func(context.Context, repository.CreateRefreshTokenParams) error {
+			t.Fatal("a retired refresh token must not mint a replacement")
+			return nil
+		},
+	}
+	c := newTestController(store)
+
+	req := authRequestWithBody(t, http.MethodPatch, "/v1/user", caller, "application/json",
+		`{"id":"`+caller.ID.String()+`","password":"newpassword"}`)
+	rec := httptest.NewRecorder()
+	c.requireSession(c.updateUser)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("password change status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if current.SessionEpoch != caller.SessionEpoch+1 {
+		t.Fatalf("session_epoch = %d, want %d", current.SessionEpoch, caller.SessionEpoch+1)
+	}
+
+	rec = doRequest(c.refresh, http.MethodPost, "/v1/refresh", "application/json",
+		`{"refresh":"`+old+`"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("refresh status = %d, want 401", rec.Code)
+	}
+}
+
+func TestRefreshRejectsInvalidTokens(t *testing.T) {
+	user := activeUser(false)
+
+	// Each case builds a store around one stored row, or none. Spending the
+	// row is the lookup, so the row is consumed either way; what must not
+	// happen is a replacement being minted.
+	tests := []struct {
+		name  string
+		store func(t *testing.T) fakeStore
+	}{
+		{
+			"unknown token",
+			func(t *testing.T) fakeStore {
+				return fakeStore{
+					consumeRefreshToken: func(context.Context, []byte) (repository.RefreshToken, error) {
+						return repository.RefreshToken{}, pgx.ErrNoRows
+					},
+				}
+			},
+		},
+		{
+			"expired token",
+			func(t *testing.T) fakeStore {
+				return fakeStore{
+					consumeRefreshToken: func(context.Context, []byte) (repository.RefreshToken, error) {
+						return repository.RefreshToken{
+							UserID:       user.ID,
+							SessionEpoch: user.SessionEpoch,
+							ExpiresAt:    time.Now().Add(-time.Minute),
+						}, nil
+					},
+					getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+						t.Fatal("expired token must be refused before the account is read")
+						return user, nil
+					},
+				}
+			},
+		},
+		{
+			"retired session generation",
+			func(t *testing.T) fakeStore {
+				return fakeStore{
+					consumeRefreshToken: func(context.Context, []byte) (repository.RefreshToken, error) {
+						return repository.RefreshToken{
+							UserID:       user.ID,
+							SessionEpoch: user.SessionEpoch + 1,
+							ExpiresAt:    time.Now().Add(time.Hour),
+						}, nil
+					},
+					getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+						return user, nil
+					},
+					createRefreshToken: func(context.Context, repository.CreateRefreshTokenParams) error {
+						t.Fatal("a token from a retired generation must not mint a replacement")
+						return nil
+					},
+				}
+			},
+		},
+		{
+			"inactive account",
+			func(t *testing.T) fakeStore {
+				inactive := user
+				inactive.Active = false
+				return fakeStore{
+					consumeRefreshToken: func(context.Context, []byte) (repository.RefreshToken, error) {
+						return repository.RefreshToken{
+							UserID:       user.ID,
+							SessionEpoch: user.SessionEpoch,
+							ExpiresAt:    time.Now().Add(time.Hour),
+						}, nil
+					},
+					getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+						return inactive, nil
+					},
+					createRefreshToken: func(context.Context, repository.CreateRefreshTokenParams) error {
+						t.Fatal("an inactive account must not be refreshed")
+						return nil
+					},
+				}
+			},
+		},
+		{
+			"account is gone",
+			func(t *testing.T) fakeStore {
+				return fakeStore{
+					consumeRefreshToken: func(context.Context, []byte) (repository.RefreshToken, error) {
+						return repository.RefreshToken{
+							UserID:       user.ID,
+							SessionEpoch: user.SessionEpoch,
+							ExpiresAt:    time.Now().Add(time.Hour),
+						}, nil
+					},
+					getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+						return repository.User{}, pgx.ErrNoRows
+					},
+					createRefreshToken: func(context.Context, repository.CreateRefreshTokenParams) error {
+						t.Fatal("a token for a deleted account must not mint a replacement")
+						return nil
+					},
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTestController(tt.store(t))
+
+			rec := doRequest(c.refresh, http.MethodPost, "/v1/refresh", "application/json",
+				`{"refresh":"some-token"}`)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rec.Code)
+			}
+		})
+	}
+}
+
+func TestRefreshBadRequests(t *testing.T) {
+	c := newTestController(fakeStore{
+		consumeRefreshToken: func(context.Context, []byte) (repository.RefreshToken, error) {
+			t.Fatal("a malformed request must not reach the store")
+			return repository.RefreshToken{}, nil
+		},
+	})
+
+	tests := []struct {
+		name        string
+		method      string
+		contentType string
+		body        string
+		want        int
+	}{
+		{"wrong method", http.MethodGet, "application/json", "", http.StatusMethodNotAllowed},
+		{"missing content type", http.MethodPost, "", `{"refresh":"x"}`, http.StatusBadRequest},
+		{"malformed body", http.MethodPost, "application/json", `{`, http.StatusBadRequest},
+		{"empty refresh", http.MethodPost, "application/json", `{"refresh":""}`, http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, "/v1/refresh", strings.NewReader(tt.body))
+			if tt.contentType != "" {
+				req.Header.Set("Content-Type", tt.contentType)
+			}
+			rec := httptest.NewRecorder()
+			c.refreshHandler(rec, req)
+			if rec.Code != tt.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.want)
+			}
+		})
 	}
 }
 
