@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/ccarlfjord/user/internal/repository"
 	"github.com/golang-jwt/jwt/v5"
@@ -30,6 +31,8 @@ type userStore interface {
 	DeleteUser(ctx context.Context, id uuid.UUID) (int64, error)
 	CreateRefreshToken(ctx context.Context, arg repository.CreateRefreshTokenParams) error
 	ConsumeRefreshToken(ctx context.Context, tokenHash []byte) (repository.RefreshToken, error)
+	DeleteExpiredRefreshTokens(ctx context.Context) (int64, error)
+	DeleteExpiredVerificationTokens(ctx context.Context) (int64, error)
 }
 
 type controller struct {
@@ -61,7 +64,39 @@ func (c *controller) Run() error {
 	r.HandleFunc("/v1/verify", c.verifyHandler)
 	r.HandleFunc("/signup", c.signupPage)
 
+	go c.purgeExpiredTokens()
+
 	return http.ListenAndServe(":8080", r)
+}
+
+// purgeExpiredInterval is how often expired refresh and verification token
+// rows are deleted. Tokens are normally consumed on use or deleted with their
+// user; the purge only reclaims rows whose owner never came back.
+const purgeExpiredInterval = 24 * time.Hour
+
+// purgeExpiredTokens deletes expired refresh and verification tokens on a
+// ticker so the tables do not grow without bound. It never stops the server:
+// a failed purge retries on the next tick.
+func (c *controller) purgeExpiredTokens() {
+	run := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if n, err := c.db.DeleteExpiredRefreshTokens(ctx); err != nil {
+			slog.Error("deleting expired refresh tokens", "error", err)
+		} else if n > 0 {
+			slog.Debug("deleted expired refresh tokens", "count", n)
+		}
+		if n, err := c.db.DeleteExpiredVerificationTokens(ctx); err != nil {
+			slog.Error("deleting expired verification tokens", "error", err)
+		} else if n > 0 {
+			slog.Debug("deleted expired verification tokens", "count", n)
+		}
+	}
+
+	run()
+	for range time.NewTicker(purgeExpiredInterval).C {
+		run()
+	}
 }
 
 func (c *controller) signupPage(w http.ResponseWriter, r *http.Request) {

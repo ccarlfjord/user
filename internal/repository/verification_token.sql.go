@@ -27,6 +27,18 @@ func (q *Queries) CreateVerificationToken(ctx context.Context, arg CreateVerific
 	return err
 }
 
+const deleteExpiredVerificationTokens = `-- name: DeleteExpiredVerificationTokens :execrows
+DELETE FROM verification_tokens WHERE expires_at < now()
+`
+
+func (q *Queries) DeleteExpiredVerificationTokens(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredVerificationTokens)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteVerificationToken = `-- name: DeleteVerificationToken :exec
 DELETE FROM verification_tokens WHERE token_hash = $1
 `

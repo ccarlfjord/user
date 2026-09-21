@@ -92,8 +92,8 @@ Ordered by priority; every item is grounded in the code as it stands.
       `rest/user_test.go` cover issuance, rotation, and every rejection path.
 - [ ] Still open on sessions: no `jti`, so there is no logout endpoint and no per-session revocation of a live
       session — bumping `session_epoch` is only the whole-account version of that; spending a refresh token cuts
-      off the refresh path but a session already minted lives out its hour. Retired or expired `refresh_tokens`
-      rows are only removed when presented, so they accumulate until one is; no janitor yet.
+      off the refresh path but a session already minted lives out its hour. Expired `refresh_tokens` rows are
+      purged by a daily janitor (`purgeExpiredTokens`) rather than only on presentation.
 
 ## P1 — schema and repository
 
@@ -108,16 +108,17 @@ Ordered by priority; every item is grounded in the code as it stands.
       `DeleteVerificationToken`. (`DeleteUser` and `UpdateUser` are wired now: the delete/update handlers call
       them.) `DeactivateUser`/`SetAdmin`/`DisableAdmin` are subsumed by `UpdateUser`'s whole-row write — delete
       them unless a narrower statement is wanted for each. Wire or delete the rest.
-- [ ] Expired `verification_tokens` are only cleaned up when the address is redeemed; abandoned signups
-      accumulate forever. Add a janitor or an `expires_at` index plus periodic sweep.
+- [x] Expired token janitor: a daily `purgeExpiredTokens` goroutine deletes expired `refresh_tokens` and
+      `verification_tokens` (`expires_at < now()`), so abandoned signups and unconsumed refresh tokens no longer
+      accumulate. Failure is logged and retried on the next tick.
 - [ ] Signing key handling: `loadSigningKey` generates 32 random bytes on every boot and relies on
       `GetOrCreateSigningKey`'s `ON CONFLICT ... DO UPDATE`. There is no `kid`/rotation versioning; simplify the
       upsert to `DO NOTHING RETURNING`.
 
 ## P1 — runtime
 
-- [ ] `main.go` opens a single `pgx.Connect`, so every request serializes on one connection. Switch to
-      `pgxpool`.
+- [x] `main.go` uses `pgxpool` instead of a single `pgx.Connect`, so queries no longer serialize on one
+      connection.
 - [ ] `controller.Run` hardcodes `:8080` in `http.ListenAndServe` and `main` calls `log.Fatal(srv.Run())`:
       no address env var, no signal handling, no graceful shutdown.
 - [ ] No `http.Server` timeouts (`ReadHeaderTimeout`, `ReadTimeout`, `IdleTimeout`) → slowloris exposure.

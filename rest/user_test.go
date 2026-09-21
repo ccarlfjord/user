@@ -32,6 +32,8 @@ type fakeStore struct {
 	deleteUser                      func(context.Context, uuid.UUID) (int64, error)
 	createRefreshToken              func(context.Context, repository.CreateRefreshTokenParams) error
 	consumeRefreshToken             func(context.Context, []byte) (repository.RefreshToken, error)
+	deleteExpiredRefreshTokens      func(context.Context) (int64, error)
+	deleteExpiredVerificationTokens func(context.Context) (int64, error)
 }
 
 func (f fakeStore) GetUserByEmail(ctx context.Context, email string) (repository.User, error) {
@@ -76,6 +78,14 @@ func (f fakeStore) CreateRefreshToken(ctx context.Context, arg repository.Create
 
 func (f fakeStore) ConsumeRefreshToken(ctx context.Context, tokenHash []byte) (repository.RefreshToken, error) {
 	return f.consumeRefreshToken(ctx, tokenHash)
+}
+
+func (f fakeStore) DeleteExpiredRefreshTokens(ctx context.Context) (int64, error) {
+	return f.deleteExpiredRefreshTokens(ctx)
+}
+
+func (f fakeStore) DeleteExpiredVerificationTokens(ctx context.Context) (int64, error) {
+	return f.deleteExpiredVerificationTokens(ctx)
 }
 
 // testSessionKey is the HMAC key newTestController signs and validates

@@ -9,3 +9,6 @@ DELETE FROM verification_tokens WHERE token_hash = $1;
 
 -- name: DeleteVerificationTokensForUser :exec
 DELETE FROM verification_tokens WHERE user_id = $1;
+
+-- name: DeleteExpiredVerificationTokens :execrows
+DELETE FROM verification_tokens WHERE expires_at < now();
