@@ -13,6 +13,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // userStore is the subset of the repository used by the handlers. It is an
@@ -43,9 +44,9 @@ type User struct {
 	Admin  bool      `json:"admin"`
 }
 
-func New(conn *pgx.Conn, sessionToken []byte) *controller {
+func New(pool *pgxpool.Pool, sessionToken []byte) *controller {
 	return &controller{
-		db:           repository.New(conn),
+		db:           repository.New(pool),
 		sessionToken: sessionToken,
 	}
 }

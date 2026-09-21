@@ -9,7 +9,7 @@ import (
 
 	"github.com/ccarlfjord/user/internal/repository"
 	"github.com/ccarlfjord/user/rest"
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
@@ -27,25 +27,26 @@ func main() {
 	}
 
 	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, connString)
+	pool, err := pgxpool.New(ctx, connString)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+
+	signingKey, err := loadSigningKey(ctx, pool)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	signingKey, err := loadSigningKey(ctx, conn)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	srv := rest.New(conn, signingKey)
+	srv := rest.New(pool, signingKey)
 
 	log.Fatal(srv.Run())
 }
 
 // loadSigningKey returns the shared JWT signing key from the database,
 // generating and persisting a new one on first boot.
-func loadSigningKey(ctx context.Context, conn *pgx.Conn) ([]byte, error) {
-	db := repository.New(conn)
+func loadSigningKey(ctx context.Context, pool *pgxpool.Pool) ([]byte, error) {
+	db := repository.New(pool)
 
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
