@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ccarlfjord/user/internal/repository"
+	"github.com/ccarlfjord/user/static"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -37,6 +38,8 @@ type userStore interface {
 	ConsumePasswordResetToken(ctx context.Context, tokenHash []byte) (repository.PasswordResetToken, error)
 	DeletePasswordResetTokensForUser(ctx context.Context, userID uuid.UUID) error
 	DeleteExpiredPasswordResetTokens(ctx context.Context) (int64, error)
+	GetUsers(ctx context.Context) ([]repository.User, error)
+	SearchUsers(ctx context.Context, query string) ([]repository.User, error)
 }
 
 type controller struct {
@@ -69,6 +72,19 @@ func (c *controller) Run() error {
 	r.HandleFunc("/v1/password/forgot", c.forgotPasswordHandler)
 	r.HandleFunc("/v1/password/reset", c.resetPasswordHandler)
 	r.HandleFunc("/signup", c.signupPage)
+
+	// The admin panel is server-rendered HTML behind requireSession plus an
+	// admin check, and its actions are htmx posts that return table fragments.
+	r.HandleFunc("/admin", c.adminOnly(c.adminPageHandler))
+	r.HandleFunc("/admin/users", c.adminOnly(c.adminUserRowsHandler))
+	r.HandleFunc("/admin/users/{id}/toggle-active", c.adminOnly(c.adminToggleActiveHandler))
+	r.HandleFunc("/admin/users/{id}/toggle-admin", c.adminOnly(c.adminToggleAdminHandler))
+	r.HandleFunc("/admin/users/{id}/delete", c.adminOnly(c.adminDeleteUserHandler))
+	r.HandleFunc("/admin/login", c.adminLoginHandler)
+	r.HandleFunc("/admin/logout", c.adminLogoutHandler)
+
+	// Assets are embedded so the binary does not depend on its working directory.
+	r.Handle("/static/", http.StripPrefix("/static/", http.FileServerFS(static.Files)))
 
 	go c.purgeExpiredTokens()
 
@@ -111,7 +127,7 @@ func (c *controller) purgeExpiredTokens() {
 }
 
 func (c *controller) signupPage(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, "static/signup.html")
+	http.ServeFileFS(w, r, static.Files, "signup.html")
 }
 
 func (c *controller) verifyHandler(w http.ResponseWriter, r *http.Request) {
@@ -164,6 +180,73 @@ func (c *controller) resetPasswordHandler(w http.ResponseWriter, r *http.Request
 	}
 }
 
+// The admin panel handlers are wrapped in adminOnly at the route, so by the
+// time they run the caller is an authenticated admin.
+
+func (c *controller) adminPageHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	c.adminPageView(w, r)
+}
+
+func (c *controller) adminUserRowsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	c.adminUserRows(w, r)
+}
+
+func (c *controller) adminToggleActiveHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	c.adminToggleActive(w, r)
+}
+
+func (c *controller) adminToggleAdminHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	c.adminToggleAdmin(w, r)
+}
+
+func (c *controller) adminDeleteUserHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	c.adminDeleteUser(w, r)
+}
+
+func (c *controller) adminLoginHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		c.adminLoginView(w, r, "")
+	case http.MethodPost:
+		c.adminLogin(w, r)
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (c *controller) adminLogoutHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	c.adminLogout(w, r)
+}
+
+func methodNotAllowed(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	w.Write([]byte("Method not allowed"))
+}
+
 func (c *controller) userHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -198,6 +281,11 @@ func (c *controller) userByIDHandler(w http.ResponseWriter, r *http.Request) {
 func (c *controller) requireSession(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		raw, ok := bearerToken(r.Header.Get("Authorization"))
+		if !ok {
+			// The admin panel navigates in a browser, which cannot set an
+			// Authorization header, so fall back to its session cookie.
+			raw, ok = cookieSession(r)
+		}
 		if !ok {
 			unauthorized(w)
 			return

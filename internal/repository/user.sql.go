@@ -125,11 +125,43 @@ func (q *Queries) GetUserById(ctx context.Context, id uuid.UUID) (User, error) {
 }
 
 const getUsers = `-- name: GetUsers :many
-SELECT id, email, hashed_password, salt, active, admin, session_epoch FROM users
+SELECT id, email, hashed_password, salt, active, admin, session_epoch FROM users ORDER BY email
 `
 
 func (q *Queries) GetUsers(ctx context.Context) ([]User, error) {
 	rows, err := q.db.Query(ctx, getUsers)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []User
+	for rows.Next() {
+		var i User
+		if err := rows.Scan(
+			&i.ID,
+			&i.Email,
+			&i.HashedPassword,
+			&i.Salt,
+			&i.Active,
+			&i.Admin,
+			&i.SessionEpoch,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const searchUsers = `-- name: SearchUsers :many
+SELECT id, email, hashed_password, salt, active, admin, session_epoch FROM users WHERE email ILIKE '%' || $1::text || '%' ORDER BY email
+`
+
+func (q *Queries) SearchUsers(ctx context.Context, query string) ([]User, error) {
+	rows, err := q.db.Query(ctx, searchUsers, query)
 	if err != nil {
 		return nil, err
 	}

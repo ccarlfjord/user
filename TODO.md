@@ -114,10 +114,11 @@ Ordered by priority; every item is grounded in the code as it stands.
 - [ ] `hashed_password` and `salt` were made nullable in `000002_user_password.up.sql`, but `models.go` still
       emits non-pointer `[]byte` and `login` nil-checks `user.HashedPassword` and `user.Salt` to decide whether
       a usable credential exists. Add a nullable `bytea` override to `sqlc.yaml` or revert the migration.
-- [ ] Generated-but-unused queries: `GetUsers`, `StoreUser`, `DeactivateUser`, `SetAdmin`, `DisableAdmin`,
-      `DeleteVerificationToken`. (`DeleteUser` and `UpdateUser` are wired now: the delete/update handlers call
-      them.) `DeactivateUser`/`SetAdmin`/`DisableAdmin` are subsumed by `UpdateUser`'s whole-row write — delete
-      them unless a narrower statement is wanted for each. Wire or delete the rest.
+- [ ] Generated-but-unused queries: `StoreUser`, `DeactivateUser`, `SetAdmin`, `DisableAdmin`,
+      `DeleteVerificationToken`. (`DeleteUser`/`UpdateUser` are wired by the API handlers and `GetUsers`/
+      `SearchUsers` by the admin panel.) `DeactivateUser`/`SetAdmin`/`DisableAdmin` are subsumed by
+      `UpdateUser`'s whole-row write — delete them unless a narrower statement is wanted for each. Wire or
+      delete the rest.
 - [x] Expired token janitor: a daily `purgeExpiredTokens` goroutine deletes expired `refresh_tokens`,
       `verification_tokens` and `password_reset_tokens` (`expires_at < now()`), so abandoned signups and
       unconsumed refresh/reset tokens no longer accumulate. Failure is logged and retried on the next tick.
@@ -132,9 +133,13 @@ Ordered by priority; every item is grounded in the code as it stands.
 - [ ] `controller.Run` hardcodes `:8080` in `http.ListenAndServe` and `main` calls `log.Fatal(srv.Run())`:
       no address env var, no signal handling, no graceful shutdown.
 - [ ] No `http.Server` timeouts (`ReadHeaderTimeout`, `ReadTimeout`, `IdleTimeout`) → slowloris exposure.
-- [ ] `signupPage` does `http.ServeFile(w, r, "static/signup.html")`, which breaks when the binary starts from
-      any other directory. Use `go:embed`.
-- [ ] No migration runner (no golang-migrate/goose); `migrations/*.sql` are applied by hand.
+- [x] `signupPage` and the panel assets are embedded: `static.Files` uses `go:embed` and is served with
+      `http.ServeFileFS` / `http.FileServerFS`, so the binary no longer depends on its working directory.
+- [ ] No migration runner (no golang-migrate/goose); `migrations/*.sql` are applied by hand. Fold this into
+      startup migrations below so a fresh instance is ready without hand-applying them.
+- [ ] Add a second database provider (SQLite) behind the repository interface: dialect-specific queries, a
+      driver alongside `pgx`, and `DATABASE_URL`-driven selection, with migrations run automatically on
+      startup so a fresh instance is ready without hand-applying them.
 
 ## P2 — hygiene
 
@@ -152,6 +157,11 @@ Ordered by priority; every item is grounded in the code as it stands.
 
 ## P2 — admin panel
 
-- [ ] Admin panel UI using htmx for interactivity and templ for server-rendered components: list/manage users
-      (search, activate/deactivate, promote/demote admin, delete), driven by the existing `UpdateUser`/
-      `DeleteUser` handlers; admin-only routes behind `requireSession` plus an admin check.
+- [x] Admin panel: server-rendered templ components driven by htmx at `/admin` (`GET` list, `GET
+      /admin/users` search fragment, `POST .../toggle-active`, `.../toggle-admin`, `.../delete`), all behind
+      `requireSession` plus an admin check (`adminOnly`). `GetUsers`/`SearchUsers` back the list; actions reuse
+      `UpdateUser`/`DeleteUser`. `requireSession` now also accepts a session cookie, and `/admin/login` +
+      `/admin/logout` issue and clear it (HttpOnly, `SameSite=Lax`) so a browser can use the panel; the
+      caller's own row renders no actions. Assets are embedded (see the go:embed item). Tests in
+      `rest/admin_test.go`. Still open: a CSRF token beyond `SameSite=Lax`, pagination, and the signup page's
+      inline script/CSP item below.

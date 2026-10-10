@@ -1,0 +1,158 @@
+package rest
+
+import (
+	"github.com/ccarlfjord/user/internal/repository"
+	"github.com/google/uuid"
+)
+
+templ adminLayout(title string) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<title>{ title }</title>
+			<script src="/static/htmx.min.js"></script>
+			<link rel="stylesheet" href="/static/admin.css"/>
+		</head>
+		<body>
+			{ children... }
+		</body>
+	</html>
+}
+
+// adminPage is the full users view. q is the active search term, if any.
+templ adminPage(users []repository.User, q string, self uuid.UUID) {
+	@adminLayout("Users · admin") {
+		<div class="topbar">
+			<h1>Users</h1>
+			<form action="/admin/logout" method="post">
+				<button class="link" type="submit">Sign out</button>
+			</form>
+		</div>
+		<form class="search" action="/admin" method="get">
+			<input
+				type="search"
+				name="q"
+				value={ q }
+				placeholder="Search by email"
+				hx-get="/admin/users"
+				hx-target="#users"
+				hx-trigger="keyup changed delay:300ms, search"
+				hx-include="this"
+			/>
+			<button type="submit">Search</button>
+		</form>
+		<table>
+			<thead>
+				<tr>
+					<th>Email</th>
+					<th>ID</th>
+					<th>Status</th>
+					<th>Role</th>
+					<th></th>
+				</tr>
+			</thead>
+			<tbody id="users">
+				@userRows(users, self)
+			</tbody>
+		</table>
+	}
+}
+
+// userRows is the fragment swapped into the table body by search.
+templ userRows(users []repository.User, self uuid.UUID) {
+	if len(users) == 0 {
+		<tr>
+			<td class="empty" colspan="5">No users match.</td>
+		</tr>
+	} else {
+		for _, user := range users {
+			@userRow(user, self)
+		}
+	}
+}
+
+// userRow is one account. Actions that would change the caller's own access
+// are not rendered for the caller's row.
+templ userRow(user repository.User, self uuid.UUID) {
+	<tr id={ "user-" + user.ID.String() }>
+		<td>{ user.Email }</td>
+		<td class="mono">{ user.ID.String() }</td>
+		<td>
+			if user.Active {
+				<span class="badge ok">active</span>
+			} else {
+				<span class="badge">inactive</span>
+			}
+		</td>
+		<td>
+			if user.Admin {
+				<span class="badge ok">admin</span>
+			} else {
+				<span class="badge">user</span>
+			}
+		</td>
+		<td class="actions">
+			if user.ID == self {
+				<span class="mono">you</span>
+			} else {
+				if user.Active {
+					<button
+						hx-post={ "/admin/users/" + user.ID.String() + "/toggle-active" }
+						hx-target={ "#user-" + user.ID.String() }
+						hx-swap="outerHTML"
+					>Deactivate</button>
+				} else {
+					<button
+						hx-post={ "/admin/users/" + user.ID.String() + "/toggle-active" }
+						hx-target={ "#user-" + user.ID.String() }
+						hx-swap="outerHTML"
+					>Activate</button>
+				}
+				if user.Admin {
+					<button
+						hx-post={ "/admin/users/" + user.ID.String() + "/toggle-admin" }
+						hx-target={ "#user-" + user.ID.String() }
+						hx-swap="outerHTML"
+					>Remove admin</button>
+				} else {
+					<button
+						hx-post={ "/admin/users/" + user.ID.String() + "/toggle-admin" }
+						hx-target={ "#user-" + user.ID.String() }
+						hx-swap="outerHTML"
+					>Make admin</button>
+				}
+				<button
+					class="danger"
+					hx-post={ "/admin/users/" + user.ID.String() + "/delete" }
+					hx-target={ "#user-" + user.ID.String() }
+					hx-swap="outerHTML"
+					hx-confirm="Delete this user? This cannot be undone."
+				>Delete</button>
+			}
+		</td>
+	</tr>
+}
+
+// adminLoginPage is the sign-in form for the panel. It is reachable without a
+// session; the POST handler sets the session cookie.
+templ adminLoginPage(message string) {
+	@adminLayout("Sign in · admin") {
+		<h1>Admin sign in</h1>
+		if message != "" {
+			<p class="error">{ message }</p>
+		}
+		<form class="stack" action="/admin/login" method="post">
+			<label>
+				Email
+				<input type="email" name="email" autocomplete="username" required/>
+			</label>
+			<label>
+				Password
+				<input type="password" name="password" autocomplete="current-password" required/>
+			</label>
+			<button type="submit">Sign in</button>
+		</form>
+	}
+}

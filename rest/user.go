@@ -472,26 +472,22 @@ var (
 	decoyHash = []byte{0x55, 0x6a, 0xb6, 0x0f, 0xb0, 0x7d, 0xb6, 0x97, 0xc2, 0x97, 0x34, 0x9c, 0x55, 0xa4, 0x1c, 0xd4, 0xc7, 0x64, 0x13, 0x3a, 0xa0, 0xd7, 0xc3, 0xe7, 0x65, 0x9c, 0x2d, 0xd4, 0xd2, 0xf5, 0xc9, 0xd4}
 )
 
-func (c *controller) login(w http.ResponseWriter, r *http.Request) {
-	if !validateContentTypeJSON(w, r) {
-		return
-	}
+// errInvalidCredentials is returned by authenticate for an unknown account or
+// a wrong password, so callers cannot tell the two apart.
+var errInvalidCredentials = errors.New("invalid credentials")
 
-	var request LoginRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	user, err := c.db.GetUserByEmail(r.Context(), request.Email)
+// authenticate checks an email/password pair with the same timing profile as a
+// login: it always runs exactly one argon2id derivation, whether or not the
+// account exists, so the response cannot be used to enumerate addresses. The
+// returned account may be inactive; callers decide what that means.
+func (c *controller) authenticate(ctx context.Context, email, password string) (repository.User, error) {
+	user, err := c.db.GetUserByEmail(ctx, email)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
-			slog.Error(err.Error())
-			w.WriteHeader(http.StatusInternalServerError)
-			return
+			return repository.User{}, err
 		}
 		// Unknown account: user stays zero, so the decoy is used below and the
-		// response is identical to a wrong password on a registered account.
+		// work is identical to a wrong password on a registered account.
 	}
 
 	// Select the credential to derive against, then run that derivation once,
@@ -503,8 +499,31 @@ func (c *controller) login(w http.ResponseWriter, r *http.Request) {
 		hash, salt = user.HashedPassword, user.Salt
 	}
 
-	if argon2.Validate(request.Password, hash, salt) != nil || !stored {
-		w.WriteHeader(http.StatusUnauthorized)
+	if argon2.Validate(password, hash, salt) != nil || !stored {
+		return repository.User{}, errInvalidCredentials
+	}
+	return user, nil
+}
+
+func (c *controller) login(w http.ResponseWriter, r *http.Request) {
+	if !validateContentTypeJSON(w, r) {
+		return
+	}
+
+	var request LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	user, err := c.authenticate(r.Context(), request.Email, request.Password)
+	if err != nil {
+		if errors.Is(err, errInvalidCredentials) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 

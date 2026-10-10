@@ -5,7 +5,10 @@ SELECT * FROM users WHERE id = $1;
 SELECT * FROM users WHERE email = $1;
 
 -- name: GetUsers :many
-SELECT * FROM users;
+SELECT * FROM users ORDER BY email;
+
+-- name: SearchUsers :many
+SELECT * FROM users WHERE email ILIKE '%' || sqlc.arg(query)::text || '%' ORDER BY email;
 
 -- name: DeleteUser :execrows
 DELETE FROM users WHERE id = $1;
