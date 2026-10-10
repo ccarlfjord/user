@@ -165,3 +165,7 @@ Ordered by priority; every item is grounded in the code as it stands.
       caller's own row renders no actions. Assets are embedded (see the go:embed item). Tests in
       `rest/admin_test.go`. Still open: a CSRF token beyond `SameSite=Lax`, pagination, and the signup page's
       inline script/CSP item below.
+- [ ] Sessions admin page: list an account's live sessions (and refresh tokens) and let an admin invalidate
+      one or all of them. Blocked on a per-session identifier (`jti`) or a server-side session inventory:
+      today sessions are stateless JWTs, only `refresh_tokens` are stored, and `session_epoch` is the
+      whole-account lever, so an individual live session cannot be revoked (see the P0 `jti` item).
