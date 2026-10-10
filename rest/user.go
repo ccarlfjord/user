@@ -41,6 +41,10 @@ const sessionTTL = 1 * time.Hour
 // back, and it is the only thing that outlives the session.
 const refreshTokenTTL = 30 * 24 * time.Hour
 
+// passwordResetTTL is how long a password reset link stays usable. It is kept
+// short because the link is a bearer credential for the account.
+const passwordResetTTL = 1 * time.Hour
+
 // sessionClaims is what a session token carries. The registered claims say who
 // it is for and when it dies; SessionEpoch ties it to the account's current
 // session generation, so a password change retires every session minted before
@@ -131,9 +135,9 @@ type CreateUserRequest struct {
 	Password string `json:"password"`
 }
 
-// signupResponse is returned identically for every sign up attempt so that
-// responses cannot be used to enumerate registered accounts.
-type signupResponse struct {
+// statusResponse is the generic acknowledgement returned by routes that must
+// not reveal whether the named account exists.
+type statusResponse struct {
 	Status string `json:"status"`
 }
 
@@ -168,7 +172,7 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case err == nil:
 		// Email already registered: return the same response as a new signup.
-		JSON(w, http.StatusCreated, signupResponse{Status: "ok"})
+		JSON(w, http.StatusCreated, statusResponse{Status: "ok"})
 		return
 	case !errors.Is(err, pgx.ErrNoRows):
 		slog.Error(err.Error())
@@ -188,7 +192,7 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			// Lost a race against a concurrent signup: same response again.
-			JSON(w, http.StatusCreated, signupResponse{Status: "ok"})
+			JSON(w, http.StatusCreated, statusResponse{Status: "ok"})
 			return
 		}
 		slog.Error(err.Error())
@@ -221,7 +225,7 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 		"url", verificationBaseURL()+"/v1/verify?token="+url.QueryEscape(token),
 	)
 
-	JSON(w, http.StatusCreated, signupResponse{Status: "ok"})
+	JSON(w, http.StatusCreated, statusResponse{Status: "ok"})
 }
 
 // deleteUserRequest names the account to delete. ID takes precedence over
@@ -648,6 +652,157 @@ func (c *controller) refresh(w http.ResponseWriter, r *http.Request) {
 		Session: sessionToken,
 		Refresh: refreshToken,
 	})
+}
+
+// passwordResetRequest names the account whose password should be reset.
+type passwordResetRequest struct {
+	Email string `json:"email"`
+}
+
+// passwordResetConfirmRequest carries a reset token and the replacement
+// password.
+type passwordResetConfirmRequest struct {
+	Token    string `json:"token"`
+	Password string `json:"password"`
+}
+
+// forgotPassword starts a password reset. The response is identical whether or
+// not the address is registered, and any outstanding token for the account is
+// retired first, so only the most recently requested link can be redeemed.
+func (c *controller) forgotPassword(w http.ResponseWriter, r *http.Request) {
+	if !validateContentTypeJSON(w, r) {
+		return
+	}
+
+	var req passwordResetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Email == "" {
+		PlainText(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+
+	user, err := c.db.GetUserByEmail(r.Context(), req.Email)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error(err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		// Unknown address: nothing to issue, but the caller must not be able to
+		// tell this apart from a registered one.
+		JSON(w, http.StatusAccepted, statusResponse{Status: "ok"})
+		return
+	}
+
+	if err := c.db.DeletePasswordResetTokensForUser(r.Context(), user.ID); err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	token, err := generateToken()
+	if err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = c.db.CreatePasswordResetToken(r.Context(), repository.CreatePasswordResetTokenParams{
+		TokenHash: hashToken(token),
+		UserID:    user.ID,
+		ExpiresAt: time.Now().Add(passwordResetTTL),
+	})
+	if err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	// No email provider is configured yet, so the reset token is logged to the
+	// console instead of being sent. Only the token hash is stored. Unlike the
+	// verification link there is no GET confirm page, so the raw token is logged
+	// for a developer to present to POST /v1/password/reset.
+	slog.Info("password reset token",
+		"email", user.Email,
+		"token", token,
+	)
+
+	JSON(w, http.StatusAccepted, statusResponse{Status: "ok"})
+}
+
+// resetPassword sets a new password from a single-use reset token. Consuming
+// the token is the lookup, so a token can be redeemed exactly once even under
+// concurrent requests, and the password change bumps the session epoch, which
+// retires every session and refresh token minted before it.
+func (c *controller) resetPassword(w http.ResponseWriter, r *http.Request) {
+	if !validateContentTypeJSON(w, r) {
+		return
+	}
+
+	var req passwordResetConfirmRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
+		PlainText(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if len(req.Password) < 8 {
+		PlainText(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+
+	stored, err := c.db.ConsumePasswordResetToken(r.Context(), hashToken(req.Token))
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error(err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		PlainText(w, http.StatusBadRequest, "invalid or expired token")
+		return
+	}
+
+	if stored.ExpiresAt.Before(time.Now()) {
+		PlainText(w, http.StatusBadRequest, "invalid or expired token")
+		return
+	}
+
+	current, err := c.db.GetUserById(r.Context(), stored.UserID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error(err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		// The account is gone; the cascade should have removed the token, so
+		// this is only reachable if the row outlived its user.
+		PlainText(w, http.StatusBadRequest, "invalid or expired token")
+		return
+	}
+
+	// A fresh salt, then a whole-row write that bumps the epoch, exactly as the
+	// PATCH handler does for a password change.
+	salt := argon2.GenerateSalt()
+	hashed := argon2.HashPassword(req.Password, salt)
+
+	_, err = c.db.UpdateUser(r.Context(), repository.UpdateUserParams{
+		ID:             current.ID,
+		Email:          current.Email,
+		HashedPassword: hashed,
+		Salt:           salt,
+		Active:         current.Active,
+		Admin:          current.Admin,
+		SessionEpoch:   current.SessionEpoch + 1,
+	})
+	if err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	// The consumed token is already gone; this clears any other outstanding one.
+	if err := c.db.DeletePasswordResetTokensForUser(r.Context(), current.ID); err != nil {
+		slog.Error(err.Error())
+	}
+
+	PlainText(w, http.StatusOK, "Password updated. You can now log in.")
 }
 
 func publicUser(user repository.User) User {

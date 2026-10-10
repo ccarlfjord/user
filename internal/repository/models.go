@@ -10,6 +10,13 @@ import (
 	"github.com/google/uuid"
 )
 
+type PasswordResetToken struct {
+	TokenHash []byte    `json:"token_hash"`
+	UserID    uuid.UUID `json:"user_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type RefreshToken struct {
 	TokenHash    []byte    `json:"token_hash"`
 	UserID       uuid.UUID `json:"user_id"`

@@ -97,10 +97,20 @@ Ordered by priority; every item is grounded in the code as it stands.
 
 ## P1 — schema and repository
 
-- [ ] `sql/password.sql` is empty — delete it or write the password-reset queries it was left for.
-- [ ] Migration gaps: `000002_user_password.down.sql` is empty (non-reversible), and `000003_auth.down.sql`
-      re-adds `username` even though `000003_auth.up.sql` drops it — a `down`/`up` round trip does not restore
-      the `000001` schema.
+- [x] `sql/password.sql` written: `CreatePasswordResetToken`, `ConsumePasswordResetToken` (a `DELETE ...
+      RETURNING`, so redemption is single-use even under concurrent requests), `DeletePasswordResetTokensForUser`
+      and `DeleteExpiredPasswordResetTokens`, against `password_reset_tokens` (migration `000006_password_reset`,
+      reversible, hash stored, `ON DELETE CASCADE`). Wired to `POST /v1/password/forgot` (issues one token,
+      clears the rest; generic `202` whether or not the address exists) and `POST /v1/password/reset` (sets a
+      fresh salt/hash and bumps `session_epoch`, retiring every session and refresh token). The link is logged
+      to the console because no email provider is configured, as with signup verification. Tests in
+      `rest/user_test.go`.
+- [x] Migration gaps: `000002_user_password.down.sql` now restores the NOT NULL columns (fails on rows still
+      NULL — credentials must be repopulated before downgrading), and `000003_auth.down.sql` restores `username`
+      as `NOT NULL UNIQUE` (`users_username_key`) and drops `signing_keys` as its `up` created it — the `up`
+      dropped the column, so the values themselves are unrecoverable; the down restores the schema shape only.
+      Verified: full `000001`→`000005` up then down cycle on a scratch database leaves zero tables, and after
+      `000003.down` the `users` table matches `000001`'s shape.
 - [ ] `hashed_password` and `salt` were made nullable in `000002_user_password.up.sql`, but `models.go` still
       emits non-pointer `[]byte` and `login` nil-checks `user.HashedPassword` and `user.Salt` to decide whether
       a usable credential exists. Add a nullable `bytea` override to `sqlc.yaml` or revert the migration.
@@ -108,9 +118,9 @@ Ordered by priority; every item is grounded in the code as it stands.
       `DeleteVerificationToken`. (`DeleteUser` and `UpdateUser` are wired now: the delete/update handlers call
       them.) `DeactivateUser`/`SetAdmin`/`DisableAdmin` are subsumed by `UpdateUser`'s whole-row write — delete
       them unless a narrower statement is wanted for each. Wire or delete the rest.
-- [x] Expired token janitor: a daily `purgeExpiredTokens` goroutine deletes expired `refresh_tokens` and
-      `verification_tokens` (`expires_at < now()`), so abandoned signups and unconsumed refresh tokens no longer
-      accumulate. Failure is logged and retried on the next tick.
+- [x] Expired token janitor: a daily `purgeExpiredTokens` goroutine deletes expired `refresh_tokens`,
+      `verification_tokens` and `password_reset_tokens` (`expires_at < now()`), so abandoned signups and
+      unconsumed refresh/reset tokens no longer accumulate. Failure is logged and retried on the next tick.
 - [ ] Signing key handling: `loadSigningKey` generates 32 random bytes on every boot and relies on
       `GetOrCreateSigningKey`'s `ON CONFLICT ... DO UPDATE`. There is no `kid`/rotation versioning; simplify the
       upsert to `DO NOTHING RETURNING`.
@@ -139,3 +149,9 @@ Ordered by priority; every item is grounded in the code as it stands.
       `LoginRequest` are exported.
 - [ ] `static/signup.html` uses an inline `<script>`; plan a CSP (nonce or external file) before adding one.
 - [ ] No client-IP or audit logging for failed logins and rejected verification tokens.
+
+## P2 — admin panel
+
+- [ ] Admin panel UI using htmx for interactivity and templ for server-rendered components: list/manage users
+      (search, activate/deactivate, promote/demote admin, delete), driven by the existing `UpdateUser`/
+      `DeleteUser` handlers; admin-only routes behind `requireSession` plus an admin check.

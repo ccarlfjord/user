@@ -21,19 +21,23 @@ import (
 )
 
 type fakeStore struct {
-	getUserByEmail                  func(context.Context, string) (repository.User, error)
-	getUserById                     func(context.Context, uuid.UUID) (repository.User, error)
-	createUser                      func(context.Context, repository.CreateUserParams) (repository.User, error)
-	createVerificationToken         func(context.Context, repository.CreateVerificationTokenParams) error
-	getVerificationToken            func(context.Context, []byte) (repository.VerificationToken, error)
-	deleteVerificationTokensForUser func(context.Context, uuid.UUID) error
-	activateUser                    func(context.Context, uuid.UUID) error
-	updateUser                      func(context.Context, repository.UpdateUserParams) (repository.User, error)
-	deleteUser                      func(context.Context, uuid.UUID) (int64, error)
-	createRefreshToken              func(context.Context, repository.CreateRefreshTokenParams) error
-	consumeRefreshToken             func(context.Context, []byte) (repository.RefreshToken, error)
-	deleteExpiredRefreshTokens      func(context.Context) (int64, error)
-	deleteExpiredVerificationTokens func(context.Context) (int64, error)
+	getUserByEmail                   func(context.Context, string) (repository.User, error)
+	getUserById                      func(context.Context, uuid.UUID) (repository.User, error)
+	createUser                       func(context.Context, repository.CreateUserParams) (repository.User, error)
+	createVerificationToken          func(context.Context, repository.CreateVerificationTokenParams) error
+	getVerificationToken             func(context.Context, []byte) (repository.VerificationToken, error)
+	deleteVerificationTokensForUser  func(context.Context, uuid.UUID) error
+	activateUser                     func(context.Context, uuid.UUID) error
+	updateUser                       func(context.Context, repository.UpdateUserParams) (repository.User, error)
+	deleteUser                       func(context.Context, uuid.UUID) (int64, error)
+	createRefreshToken               func(context.Context, repository.CreateRefreshTokenParams) error
+	consumeRefreshToken              func(context.Context, []byte) (repository.RefreshToken, error)
+	deleteExpiredRefreshTokens       func(context.Context) (int64, error)
+	deleteExpiredVerificationTokens  func(context.Context) (int64, error)
+	createPasswordResetToken         func(context.Context, repository.CreatePasswordResetTokenParams) error
+	consumePasswordResetToken        func(context.Context, []byte) (repository.PasswordResetToken, error)
+	deletePasswordResetTokensForUser func(context.Context, uuid.UUID) error
+	deleteExpiredPasswordResetTokens func(context.Context) (int64, error)
 }
 
 func (f fakeStore) GetUserByEmail(ctx context.Context, email string) (repository.User, error) {
@@ -86,6 +90,22 @@ func (f fakeStore) DeleteExpiredRefreshTokens(ctx context.Context) (int64, error
 
 func (f fakeStore) DeleteExpiredVerificationTokens(ctx context.Context) (int64, error) {
 	return f.deleteExpiredVerificationTokens(ctx)
+}
+
+func (f fakeStore) CreatePasswordResetToken(ctx context.Context, arg repository.CreatePasswordResetTokenParams) error {
+	return f.createPasswordResetToken(ctx, arg)
+}
+
+func (f fakeStore) ConsumePasswordResetToken(ctx context.Context, tokenHash []byte) (repository.PasswordResetToken, error) {
+	return f.consumePasswordResetToken(ctx, tokenHash)
+}
+
+func (f fakeStore) DeletePasswordResetTokensForUser(ctx context.Context, userID uuid.UUID) error {
+	return f.deletePasswordResetTokensForUser(ctx, userID)
+}
+
+func (f fakeStore) DeleteExpiredPasswordResetTokens(ctx context.Context) (int64, error) {
+	return f.deleteExpiredPasswordResetTokens(ctx)
 }
 
 // testSessionKey is the HMAC key newTestController signs and validates
@@ -1812,6 +1832,222 @@ func TestUpdateUserBadRequests(t *testing.T) {
 
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400", rec.Code)
+			}
+		})
+	}
+}
+
+// forgetting a password for a registered address issues a single live token
+// and answers with the same generic body as any other account.
+func TestForgotPasswordIssuesResetToken(t *testing.T) {
+	user := activeUser(false)
+	var stored repository.CreatePasswordResetTokenParams
+	cleared := false
+	store := fakeStore{
+		getUserByEmail: func(_ context.Context, email string) (repository.User, error) {
+			if email != user.Email {
+				t.Fatalf("looked up %q, want %q", email, user.Email)
+			}
+			return user, nil
+		},
+		deletePasswordResetTokensForUser: func(_ context.Context, id uuid.UUID) error {
+			cleared = true
+			if id != user.ID {
+				t.Fatalf("cleared tokens for %s, want %s", id, user.ID)
+			}
+			return nil
+		},
+		createPasswordResetToken: func(_ context.Context, arg repository.CreatePasswordResetTokenParams) error {
+			stored = arg
+			return nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := doRequest(c.forgotPassword, http.MethodPost, "/v1/password/forgot", "application/json",
+		`{"email":"`+user.Email+`"}`)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", rec.Code)
+	}
+	if !cleared {
+		t.Fatal("outstanding reset tokens were not cleared")
+	}
+	if stored.UserID != user.ID {
+		t.Fatalf("token names %s, want %s", stored.UserID, user.ID)
+	}
+	if !stored.ExpiresAt.After(time.Now().Add(passwordResetTTL - time.Hour)) {
+		t.Fatalf("token expires %s, want about %s out", stored.ExpiresAt, passwordResetTTL)
+	}
+	if len(stored.TokenHash) == 0 {
+		t.Fatal("token hash was not stored")
+	}
+}
+
+func TestForgotPasswordUnknownEmailIsIndistinguishable(t *testing.T) {
+	issued := false
+	store := fakeStore{
+		getUserByEmail: func(context.Context, string) (repository.User, error) {
+			return repository.User{}, pgx.ErrNoRows
+		},
+		createPasswordResetToken: func(context.Context, repository.CreatePasswordResetTokenParams) error {
+			issued = true
+			return nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := doRequest(c.forgotPassword, http.MethodPost, "/v1/password/forgot", "application/json",
+		`{"email":"nobody@example.com"}`)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", rec.Code)
+	}
+	if got := rec.Body.String(); got != `{"status":"ok"}` {
+		t.Fatalf("body = %q, want the generic acknowledgement", got)
+	}
+	if issued {
+		t.Fatal("a reset token was issued for an unknown address")
+	}
+}
+
+// A successful reset stores a fresh credential and bumps the session epoch, so
+// every session and refresh token minted before the reset stops working.
+func TestResetPasswordUpdatesCredentialAndRetiresSessions(t *testing.T) {
+	oldSalt := []byte("0123456789abcdef")
+	user := activeUser(false)
+	user.HashedPassword = argon2.HashPassword("oldpassword", oldSalt)
+	user.Salt = oldSalt
+	user.SessionEpoch = 2
+
+	token := "reset-token-value"
+	var stored repository.UpdateUserParams
+	store := fakeStore{
+		consumePasswordResetToken: func(_ context.Context, tokenHash []byte) (repository.PasswordResetToken, error) {
+			if !bytes.Equal(tokenHash, hashToken(token)) {
+				t.Fatalf("consumed hash %x, want the presented token's", tokenHash)
+			}
+			return repository.PasswordResetToken{
+				TokenHash: tokenHash,
+				UserID:    user.ID,
+				ExpiresAt: time.Now().Add(time.Hour),
+			}, nil
+		},
+		getUserById: func(_ context.Context, id uuid.UUID) (repository.User, error) {
+			if id != user.ID {
+				t.Fatalf("read account %s, want %s", id, user.ID)
+			}
+			return user, nil
+		},
+		updateUser: func(_ context.Context, arg repository.UpdateUserParams) (repository.User, error) {
+			stored = arg
+			return repository.User{ID: arg.ID, Email: arg.Email, Active: arg.Active, Admin: arg.Admin}, nil
+		},
+		deletePasswordResetTokensForUser: func(context.Context, uuid.UUID) error { return nil },
+	}
+	c := newTestController(store)
+
+	rec := doRequest(c.resetPassword, http.MethodPost, "/v1/password/reset", "application/json",
+		`{"token":"`+token+`","password":"newpassword"}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if err := argon2.Validate("newpassword", stored.HashedPassword, stored.Salt); err != nil {
+		t.Fatalf("stored credential does not validate the new password: %v", err)
+	}
+	if bytes.Equal(stored.Salt, oldSalt) {
+		t.Fatal("reset reused the stored salt")
+	}
+	if stored.SessionEpoch != user.SessionEpoch+1 {
+		t.Fatalf("session_epoch = %d, want %d", stored.SessionEpoch, user.SessionEpoch+1)
+	}
+	if stored.Email != user.Email || !stored.Active || stored.Admin {
+		t.Fatalf("reset disturbed untouched fields: %+v", stored)
+	}
+	if bytes.Contains(rec.Body.Bytes(), stored.HashedPassword) || bytes.Contains(rec.Body.Bytes(), stored.Salt) {
+		t.Fatal("response leaked stored password material")
+	}
+}
+
+func TestResetPasswordRejectsInvalidOrExpiredToken(t *testing.T) {
+	user := activeUser(false)
+	tests := []struct {
+		name  string
+		store fakeStore
+	}{
+		{
+			"unknown token",
+			fakeStore{
+				consumePasswordResetToken: func(context.Context, []byte) (repository.PasswordResetToken, error) {
+					return repository.PasswordResetToken{}, pgx.ErrNoRows
+				},
+			},
+		},
+		{
+			"expired token",
+			fakeStore{
+				consumePasswordResetToken: func(context.Context, []byte) (repository.PasswordResetToken, error) {
+					return repository.PasswordResetToken{UserID: user.ID, ExpiresAt: time.Now().Add(-time.Minute)}, nil
+				},
+				getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+					t.Fatal("expired token must be refused before the account is read")
+					return user, nil
+				},
+			},
+		},
+		{
+			"account is gone",
+			fakeStore{
+				consumePasswordResetToken: func(context.Context, []byte) (repository.PasswordResetToken, error) {
+					return repository.PasswordResetToken{UserID: user.ID, ExpiresAt: time.Now().Add(time.Hour)}, nil
+				},
+				getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+					return repository.User{}, pgx.ErrNoRows
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := doRequest(newTestController(tt.store).resetPassword, http.MethodPost,
+				"/v1/password/reset", "application/json", `{"token":"some-token","password":"newpassword"}`)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", rec.Code)
+			}
+			if !bytes.Contains(rec.Body.Bytes(), []byte("invalid or expired token")) {
+				t.Fatalf("body = %q, want the generic token error", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestPasswordResetBadRequests(t *testing.T) {
+	c := newTestController(fakeStore{})
+
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		method  string
+		content string
+		body    string
+		want    int
+	}{
+		{"forgot wrong method", c.forgotPasswordHandler, http.MethodGet, "application/json", "", http.StatusMethodNotAllowed},
+		{"forgot bad content type", c.forgotPasswordHandler, http.MethodPost, "text/plain", `{"email":"a@b.com"}`, http.StatusBadRequest},
+		{"forgot empty email", c.forgotPasswordHandler, http.MethodPost, "application/json", `{"email":""}`, http.StatusBadRequest},
+		{"reset wrong method", c.resetPasswordHandler, http.MethodGet, "application/json", "", http.StatusMethodNotAllowed},
+		{"reset bad content type", c.resetPasswordHandler, http.MethodPost, "text/plain", `{"token":"x","password":"newpassword"}`, http.StatusBadRequest},
+		{"reset empty token", c.resetPasswordHandler, http.MethodPost, "application/json", `{"token":"","password":"newpassword"}`, http.StatusBadRequest},
+		{"reset short password", c.resetPasswordHandler, http.MethodPost, "application/json", `{"token":"x","password":"short"}`, http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := doRequest(tt.handler, tt.method, "/v1/password/x", tt.content, tt.body)
+			if rec.Code != tt.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.want)
 			}
 		})
 	}

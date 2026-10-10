@@ -33,6 +33,10 @@ type userStore interface {
 	ConsumeRefreshToken(ctx context.Context, tokenHash []byte) (repository.RefreshToken, error)
 	DeleteExpiredRefreshTokens(ctx context.Context) (int64, error)
 	DeleteExpiredVerificationTokens(ctx context.Context) (int64, error)
+	CreatePasswordResetToken(ctx context.Context, arg repository.CreatePasswordResetTokenParams) error
+	ConsumePasswordResetToken(ctx context.Context, tokenHash []byte) (repository.PasswordResetToken, error)
+	DeletePasswordResetTokensForUser(ctx context.Context, userID uuid.UUID) error
+	DeleteExpiredPasswordResetTokens(ctx context.Context) (int64, error)
 }
 
 type controller struct {
@@ -62,6 +66,8 @@ func (c *controller) Run() error {
 	r.HandleFunc("/v1/login", c.loginHandler)
 	r.HandleFunc("/v1/refresh", c.refreshHandler)
 	r.HandleFunc("/v1/verify", c.verifyHandler)
+	r.HandleFunc("/v1/password/forgot", c.forgotPasswordHandler)
+	r.HandleFunc("/v1/password/reset", c.resetPasswordHandler)
 	r.HandleFunc("/signup", c.signupPage)
 
 	go c.purgeExpiredTokens()
@@ -90,6 +96,11 @@ func (c *controller) purgeExpiredTokens() {
 			slog.Error("deleting expired verification tokens", "error", err)
 		} else if n > 0 {
 			slog.Debug("deleted expired verification tokens", "count", n)
+		}
+		if n, err := c.db.DeleteExpiredPasswordResetTokens(ctx); err != nil {
+			slog.Error("deleting expired password reset tokens", "error", err)
+		} else if n > 0 {
+			slog.Debug("deleted expired password reset tokens", "count", n)
 		}
 	}
 
@@ -127,6 +138,26 @@ func (c *controller) refreshHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		c.refresh(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte("Method not allowed"))
+	}
+}
+
+func (c *controller) forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		c.forgotPassword(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte("Method not allowed"))
+	}
+}
+
+func (c *controller) resetPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		c.resetPassword(w, r)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		w.Write([]byte("Method not allowed"))
