@@ -585,6 +585,9 @@ func (c *controller) mintSession(user repository.User) (string, error) {
 		},
 		SessionEpoch: &user.SessionEpoch,
 	})
+	// Name the key in the header so a verifier can select the right one from a
+	// rotating key set instead of trying every published key.
+	token.Header["kid"] = keyID(&c.oidcKey.PublicKey)
 
 	return token.SignedString(c.oidcKey)
 }

@@ -380,6 +380,12 @@ func (c *controller) sessionKey(t *jwt.Token) (any, error) {
 	if c.oidcKey == nil {
 		return nil, errors.New("no signing key loaded")
 	}
+	// Select by key id. One key exists today, so any id but the current one is
+	// unknown; when rotation lands this becomes a lookup over the published key
+	// set so a token signed just before the switch still verifies.
+	if kid, _ := t.Header["kid"].(string); kid != keyID(&c.oidcKey.PublicKey) {
+		return nil, fmt.Errorf("unknown key id %q", kid)
+	}
 	return &c.oidcKey.PublicKey, nil
 }
 

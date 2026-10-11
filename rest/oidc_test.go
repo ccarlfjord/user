@@ -117,6 +117,30 @@ func publicKeyFromJWK(t *testing.T, key jwk) *ecdsa.PublicKey {
 	}
 }
 
+// A minted session must name its key so a verifier can select the right one
+// from a rotating key set.
+func TestMintedSessionCarriesKeyID(t *testing.T) {
+	c := newTestController(fakeStore{})
+
+	signed, err := c.mintSession(activeUser(false))
+	if err != nil {
+		t.Fatalf("mint session: %v", err)
+	}
+
+	token, err := jwt.ParseWithClaims(signed, new(sessionClaims), c.sessionKey,
+		jwt.WithValidMethods([]string{"ES256"}))
+	if err != nil {
+		t.Fatalf("parse minted session: %v", err)
+	}
+	if got := token.Header["alg"]; got != "ES256" {
+		t.Fatalf("alg = %v, want ES256", got)
+	}
+	want := keyID(&testSigningKey.PublicKey)
+	if got := token.Header["kid"]; got != want {
+		t.Fatalf("kid = %v, want %s", got, want)
+	}
+}
+
 func TestKeyIDIsStableAndKeySpecific(t *testing.T) {
 	first := keyID(&testSigningKey.PublicKey)
 	if again := keyID(&testSigningKey.PublicKey); again != first {

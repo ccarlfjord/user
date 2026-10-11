@@ -878,11 +878,14 @@ func mintedClaims(sub string, epoch int32) sessionClaims {
 	}
 }
 
-// signClaims signs an arbitrary claim set with key.
+// signClaims signs an arbitrary claim set with key, naming the key in the
+// token header the way mintSession does.
 func signClaims(t *testing.T, key *ecdsa.PrivateKey, claims sessionClaims) string {
 	t.Helper()
 
-	signed, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(key)
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	token.Header["kid"] = keyID(&key.PublicKey)
+	signed, err := token.SignedString(key)
 	if err != nil {
 		t.Fatalf("sign session: %v", err)
 	}
@@ -959,6 +962,26 @@ func TestRequireSessionRejectsInvalidTokens(t *testing.T) {
 		return signed
 	}()
 
+	// Missing and unknown key ids: the verifier selects by kid, so neither may
+	// verify even though the signature itself is valid.
+	noKid := func() string {
+		token := jwt.NewWithClaims(jwt.SigningMethodES256, mintedClaims(sub, 0))
+		signed, err := token.SignedString(key)
+		if err != nil {
+			t.Fatalf("sign token without kid: %v", err)
+		}
+		return signed
+	}()
+	unknownKid := func() string {
+		token := jwt.NewWithClaims(jwt.SigningMethodES256, mintedClaims(sub, 0))
+		token.Header["kid"] = "not-the-current-key"
+		signed, err := token.SignedString(key)
+		if err != nil {
+			t.Fatalf("sign token with unknown kid: %v", err)
+		}
+		return signed
+	}()
+
 	expired := time.Now().Add(-time.Minute)
 	tests := []struct {
 		name   string
@@ -994,6 +1017,8 @@ func TestRequireSessionRejectsInvalidTokens(t *testing.T) {
 			c.SessionEpoch = nil
 		}))},
 		{"hs256", "Bearer " + hs256},
+		{"missing kid", "Bearer " + noKid},
+		{"unknown kid", "Bearer " + unknownKid},
 		{"alg none", "Bearer " + none},
 		{"empty subject", "Bearer " + signClaims(t, key, vary(func(c *sessionClaims) {
 			c.Subject = ""
