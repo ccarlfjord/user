@@ -34,9 +34,15 @@ and validate the result.
       verify without holding anything that mints. Sessions moved off HS256 with it: `mintSession` signs ES256
       and `requireSession`/`sessionKey` verify against the public key, pinned to that one algorithm.
 - [ ] Signing-key rotation: one key exists and the JWKS advertises one `kid`, and `mintSession` does not put a
-      `kid` in the JWT header, so a relying party has nothing to select a key by. Add the `kid` header, a
-      second key row, and a JWKS that publishes both during an overlap window with a retirement path for the
-      old key (see the P1 signing-key item too).
+      `kid` in the JWT header, so a relying party has nothing to select a key by. Rotation is overlap-only:
+      generate a new key and sign with it, publish both public keys in the JWKS, and drop the old one from the
+      JWKS only once the longest signed-token lifetime has passed since it was last used to sign. Nothing is
+      revoked and nothing is deleted: a token whose `kid` is no longer advertised has already expired. The
+      current bound is `sessionTTL` (1h, plus a clock-skew margin), because refresh tokens are opaque random
+      values and are not signed. Needs the `kid` JWT header, multiple key rows selected by `created_at` (the
+      fixed `oidc_signing_key` name holds only one), and a JWKS that hides a key after that window. Keeping a
+      retired key published indefinitely is also harmless at this scale, so the time filter is a
+      tidy-up rather than a correctness requirement (see the P1 signing-key item too).
 - [ ] Clients: no registry of relying parties — no `client_id`, no
       `client_secret`, no redirect URI allowlist, no scopes anywhere in the
       schema. `/authorize` cannot know where a user may be sent back to until
