@@ -1,0 +1,3 @@
+-- 000007 is a data-only migration: it lowercases and trims addresses that
+-- predate normalization. The original casing and surrounding whitespace are
+-- not recoverable, so there is nothing to reverse.

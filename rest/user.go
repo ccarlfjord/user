@@ -55,6 +55,16 @@ type sessionClaims struct {
 	SessionEpoch *int32 `json:"epoch"`
 }
 
+// normalizeEmail puts an address in the one form the service stores and looks
+// up: surrounding whitespace removed and letters lowercased. Without it
+// `Foo@x.com` and `foo@x.com` are distinct rows and the unique index on
+// `users.email` does not catch the second signup. Every entry point that
+// accepts, stores, or compares an address funnels through here, so a stored
+// address is always already normalized.
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
 // getUser returns the caller's own record, or the account named by the email
 // query parameter. Naming another account requires admin; a non-admin's own
 // address is resolved from the session, so an address that is not theirs is
@@ -156,7 +166,8 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Email == "" || len(req.Password) < 8 {
+	email := normalizeEmail(req.Email)
+	if email == "" || len(req.Password) < 8 {
 		PlainText(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -168,7 +179,7 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 	salt := argon2.GenerateSalt()
 	hashedPassword := argon2.HashPassword(req.Password, salt)
 
-	_, err := c.db.GetUserByEmail(r.Context(), req.Email)
+	_, err := c.db.GetUserByEmail(r.Context(), email)
 	switch {
 	case err == nil:
 		// Email already registered: return the same response as a new signup.
@@ -182,7 +193,7 @@ func (c *controller) createUser(w http.ResponseWriter, r *http.Request) {
 
 	userParams := repository.CreateUserParams{
 		ID:             uuid.New(),
-		Email:          req.Email,
+		Email:          email,
 		HashedPassword: hashedPassword,
 		Salt:           salt,
 	}
@@ -314,9 +325,13 @@ func (c *controller) updateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Email != nil && *req.Email == "" {
-		PlainText(w, http.StatusBadRequest, "invalid request")
-		return
+	if req.Email != nil {
+		email := normalizeEmail(*req.Email)
+		if email == "" {
+			PlainText(w, http.StatusBadRequest, "invalid request")
+			return
+		}
+		req.Email = &email
 	}
 	if req.Password != nil && len(*req.Password) < 8 {
 		PlainText(w, http.StatusBadRequest, "invalid request")
@@ -419,6 +434,7 @@ func (c *controller) resolveTarget(w http.ResponseWriter, r *http.Request, calle
 		return userID, true
 	}
 
+	email = normalizeEmail(email)
 	if email == "" {
 		PlainText(w, http.StatusBadRequest, "missing id or email")
 		return uuid.Nil, false
@@ -481,6 +497,7 @@ var errInvalidCredentials = errors.New("invalid credentials")
 // account exists, so the response cannot be used to enumerate addresses. The
 // returned account may be inactive; callers decide what that means.
 func (c *controller) authenticate(ctx context.Context, email, password string) (repository.User, error) {
+	email = normalizeEmail(email)
 	user, err := c.db.GetUserByEmail(ctx, email)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -694,7 +711,12 @@ func (c *controller) forgotPassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req passwordResetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Email == "" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		PlainText(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	req.Email = normalizeEmail(req.Email)
+	if req.Email == "" {
 		PlainText(w, http.StatusBadRequest, "invalid request")
 		return
 	}

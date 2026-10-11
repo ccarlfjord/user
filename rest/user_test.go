@@ -242,6 +242,7 @@ func TestCreateUserBadRequests(t *testing.T) {
 		{"bad content type", "text/plain", `{"email":"a@b.com","username":"ab","password":"password1"}`},
 		{"short password", "application/json", `{"email":"a@b.com","username":"ab","password":"short"}`},
 		{"empty email", "application/json", `{"email":"","username":"ab","password":"password1"}`},
+		{"whitespace-only email", "application/json", `{"email":"   ","username":"ab","password":"password1"}`},
 		{"malformed json", "application/json", `{`},
 	}
 
@@ -252,6 +253,37 @@ func TestCreateUserBadRequests(t *testing.T) {
 				t.Fatalf("status = %d, want 400", rec.Code)
 			}
 		})
+	}
+}
+
+func TestCreateUserNormalizesEmail(t *testing.T) {
+	var lookedUp, stored string
+	store := fakeStore{
+		getUserByEmail: func(_ context.Context, email string) (repository.User, error) {
+			lookedUp = email
+			return repository.User{}, pgx.ErrNoRows
+		},
+		createUser: func(_ context.Context, arg repository.CreateUserParams) (repository.User, error) {
+			stored = arg.Email
+			return repository.User{ID: arg.ID, Email: arg.Email, Active: arg.Active}, nil
+		},
+		createVerificationToken: func(context.Context, repository.CreateVerificationTokenParams) error {
+			return nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := doRequest(c.createUser, http.MethodPost, "/v1/user", "application/json",
+		`{"email":"  A@B.Com ","password":"password1"}`)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", rec.Code)
+	}
+	if lookedUp != "a@b.com" {
+		t.Fatalf("lookup email = %q, want a@b.com", lookedUp)
+	}
+	if stored != "a@b.com" {
+		t.Fatalf("stored email = %q, want a@b.com", stored)
 	}
 }
 
@@ -282,6 +314,39 @@ func TestLoginFailuresAreIndistinguishable(t *testing.T) {
 	}
 	if unknown.Body.String() != wrong.Body.String() {
 		t.Fatalf("bodies differ: %q vs %q", unknown.Body.String(), wrong.Body.String())
+	}
+}
+
+func TestLoginNormalizesEmail(t *testing.T) {
+	salt := []byte("0123456789abcdef")
+	user := repository.User{
+		ID:             uuid.New(),
+		Email:          "known@example.com",
+		HashedPassword: argon2.HashPassword("rightpassword", salt),
+		Salt:           salt,
+		Active:         true,
+	}
+
+	var lookedUp string
+	store := fakeStore{
+		getUserByEmail: func(_ context.Context, email string) (repository.User, error) {
+			lookedUp = email
+			return user, nil
+		},
+		createRefreshToken: func(context.Context, repository.CreateRefreshTokenParams) error {
+			return nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := doRequest(c.login, http.MethodPost, "/v1/login", "application/json",
+		`{"email":"Known@Example.COM","password":"rightpassword"}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if lookedUp != "known@example.com" {
+		t.Fatalf("lookup email = %q, want known@example.com", lookedUp)
 	}
 }
 
@@ -1358,6 +1423,57 @@ func TestGetUserByEmail(t *testing.T) {
 	})
 }
 
+func TestResolveTargetNormalizesEmail(t *testing.T) {
+	caller := activeUser(false)
+	other := repository.User{ID: uuid.New(), Email: "other@example.com", Active: true, Admin: true}
+
+	t.Run("own address matches despite case", func(t *testing.T) {
+		store := fakeStore{
+			getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+				return caller, nil
+			},
+			getUserByEmail: func(context.Context, string) (repository.User, error) {
+				t.Fatal("the caller's own address was looked up")
+				return repository.User{}, nil
+			},
+		}
+
+		rec := httptest.NewRecorder()
+		newTestController(store).userHandler(rec, authRequest(t, http.MethodGet,
+			"/v1/user?email=Caller@Example.COM", caller))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+	})
+
+	t.Run("admin lookup is normalized", func(t *testing.T) {
+		admin := activeUser(true)
+		store := fakeStore{
+			getUserById: func(_ context.Context, id uuid.UUID) (repository.User, error) {
+				if id == admin.ID {
+					return admin, nil
+				}
+				return other, nil
+			},
+			getUserByEmail: func(_ context.Context, email string) (repository.User, error) {
+				if email != other.Email {
+					t.Fatalf("looked up %q, want %q", email, other.Email)
+				}
+				return other, nil
+			},
+		}
+
+		rec := httptest.NewRecorder()
+		newTestController(store).userHandler(rec, authRequest(t, http.MethodGet,
+			"/v1/user?email=Other@Example.COM", admin))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+	})
+}
+
 func TestDeleteUserSelfDeletesAccount(t *testing.T) {
 	caller := activeUser(false)
 	deleted := uuid.Nil
@@ -1690,6 +1806,32 @@ func TestUpdateUserChangesEmailKeepsCredential(t *testing.T) {
 	}
 }
 
+func TestUpdateUserNormalizesEmail(t *testing.T) {
+	caller := activeUser(false)
+	var stored repository.UpdateUserParams
+	store := fakeStore{
+		getUserById: func(context.Context, uuid.UUID) (repository.User, error) {
+			return caller, nil
+		},
+		updateUser: func(_ context.Context, arg repository.UpdateUserParams) (repository.User, error) {
+			stored = arg
+			return repository.User{ID: arg.ID, Email: arg.Email, Active: arg.Active, Admin: arg.Admin}, nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := httptest.NewRecorder()
+	c.userHandler(rec, authRequestWithBody(t, http.MethodPatch, "/v1/user", caller, "application/json",
+		`{"id":"`+caller.ID.String()+`","email":"  New@Example.COM "}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if stored.Email != "new@example.com" {
+		t.Fatalf("stored email = %q, want new@example.com", stored.Email)
+	}
+}
+
 func TestUpdateUserNonAdminMayNotWritePrivilegedFields(t *testing.T) {
 	caller := activeUser(false)
 	other := repository.User{ID: uuid.New(), Email: "other@example.com", Active: true}
@@ -1891,6 +2033,32 @@ func TestForgotPasswordIssuesResetToken(t *testing.T) {
 	}
 	if len(stored.TokenHash) == 0 {
 		t.Fatal("token hash was not stored")
+	}
+}
+
+func TestForgotPasswordNormalizesEmail(t *testing.T) {
+	user := activeUser(false)
+	var lookedUp string
+	store := fakeStore{
+		getUserByEmail: func(_ context.Context, email string) (repository.User, error) {
+			lookedUp = email
+			return user, nil
+		},
+		deletePasswordResetTokensForUser: func(context.Context, uuid.UUID) error { return nil },
+		createPasswordResetToken: func(context.Context, repository.CreatePasswordResetTokenParams) error {
+			return nil
+		},
+	}
+	c := newTestController(store)
+
+	rec := doRequest(c.forgotPassword, http.MethodPost, "/v1/password/forgot", "application/json",
+		`{"email":"  `+user.Email+` "}`)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", rec.Code)
+	}
+	if lookedUp != user.Email {
+		t.Fatalf("lookup email = %q, want %q", lookedUp, user.Email)
 	}
 }
 

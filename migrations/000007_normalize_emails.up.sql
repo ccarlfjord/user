@@ -1,0 +1,11 @@
+-- Email addresses are stored in one normalized form: surrounding whitespace
+-- removed and letters lowercased. The application enforces this on every read
+-- and write (`normalizeEmail` in rest/user.go); this migration brings rows
+-- created before that rule into the same form so a normalized lookup still
+-- finds them.
+--
+-- This can fail on `users_email_key` if two accounts differ only by case or
+-- surrounding whitespace. That is intentional: such a pair is exactly the
+-- collision the rule exists to prevent, and an operator has to decide which
+-- account survives before the unique index can hold.
+UPDATE users SET email = lower(btrim(email));

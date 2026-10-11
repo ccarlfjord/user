@@ -65,8 +65,13 @@ Ordered by priority; every item is grounded in the code as it stands.
       history. Move redemption behind a POST/confirm page (single-use is already enforced by deleting tokens).
 - [ ] Only a minimum password length is enforced (`len(req.Password) < 8`); no maximum, so argon2 runs on
       unbounded input. Add an upper bound.
-- [ ] `users.email` is `TEXT UNIQUE` with no normalization: `Foo@x.com` and `foo@x.com` are distinct accounts
-      and the unique index will not catch it. Normalize on write/read or use `citext`.
+- [x] Email normalization: `normalizeEmail` (`rest/user.go`) trims surrounding whitespace and lowercases, and
+      every entry point that accepts, stores, or compares an address applies it — signup, login (inside
+      `authenticate`, so the admin panel's login too), PATCH, both branches of `resolveTarget` (the non-admin
+      self-comparison and the admin lookup), and the forgot-password lookup. Stored addresses are therefore
+      always already normalized, so `users.email TEXT UNIQUE` catches a second signup for a differently-cased
+      address; migration `000007_normalize_emails` lowercases and trims rows that predate the rule and fails
+      loudly on `users_email_key` if two accounts differ only by case. `citext` was not needed.
 - [ ] `login` returns `403 "account not verified"` for inactive users after a successful password check, which
       confirms a valid credential pair. Decide whether that leak is acceptable.
 - [x] Session claims and password-change invalidation. Tokens carry `iss`/`aud` (the `sessionIssuer`/`sessionAudience`
