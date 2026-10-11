@@ -49,6 +49,12 @@ type RefreshToken struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+type RegistrationToken struct {
+	TokenHash []byte    `json:"token_hash"`
+	ExpiresAt time.Time `json:"expires_at"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type SigningKey struct {
 	Name      string    `json:"name"`
 	Value     []byte    `json:"value"`

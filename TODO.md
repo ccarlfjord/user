@@ -18,6 +18,19 @@ Ordered by priority; every item is grounded in the code as it stands.
       `authorization_endpoint`. The stale `jwt_signing_key` row — the HS256
       secret sessions used before ES256 — was deleted; nothing has read it
       since the key moved to `oidc_signing_key`.
+- [x] RFC 7591 dynamic client registration (`POST /register`,
+      `rest/register.go`): gated by a single-use initial access token (stored
+      as a SHA-256 hash, migration `000010`, consumed atomically with
+      `DELETE ... RETURNING`), metadata validated before the token is burned,
+      public (`token_endpoint_auth_method: none`, no secret) vs confidential
+      (basic or post) clients, defaults filled in and echoed. The client
+      secret comes back exactly once; only its hash is stored, and that hash
+      is plain SHA-256 (`hashToken`, the same lookup every server-minted
+      token uses) — a client secret is 256 bits of server randomness, not a
+      human-chosen password, so there is nothing for a slow KDF or a salt to
+      add. Argon2id remains reserved for `users.hashed_password`. Applied to
+      the local database by hand like the rest, and verified end to end with
+      curl.
 
 ## P0 — OIDC provider
 
@@ -64,20 +77,32 @@ token → userinfo → logout).
       to authenticate. Two CHECK constraints hold the invariants: a client with an
       empty `redirect_uris` array cannot be stored (`cardinality()`, not
       `array_length()` — the latter is NULL for an empty array and a NULL CHECK
-      passes), and a public client cannot carry a secret hash (nor a confidential
-      one lack it). `CreateClient`/`GetClientById`/`DeleteClient` in `sql/client.sql`;
-      nothing reads them yet until `/authorize` lands.
-- [ ] Redirect URI rules, redirect-time half: storage is exact-match strings
-      (`TEXT[]`, no wildcards, done with the schema); the character-by-character
-      comparison against the `redirect_uri` request parameter is `/authorize`
-      handler work and lands with it.
+      passes), and a public client cannot carry a secret hash or salt (nor a
+      confidential one lack it; the hash is SHA-256, since the secret is
+      server-generated). `CreateClient`/`GetClientById`/`DeleteClient` in
+      `sql/client.sql`; `GetClientById` serves `/authorize`.
+- [x] Redirect URI rules, both halves: storage is exact-match strings (`TEXT[]`,
+      no wildcards, done with the schema) and the redirect-time comparison is
+      byte-for-byte against the client's registered URIs (`redirectURIRegistered`,
+      `rest/authorize.go`) — no scheme/host normalization, no trailing-slash
+      tolerance, no wildcard. A mismatch before any other validation renders the
+      error page and never redirects. Registered URIs may carry their own query;
+      issued redirects append with `&` when one is present.
 - [x] Scope vocabulary: `ScopeOpenID`/`ScopeEmail` constants in `rest/oidc.go`,
       and discovery's `scopes_supported` now lists exactly that shared list rather
       than an inline literal. `profile` comes when a `profile` claim exists to hang
       it on. Storing the grant per authorization is part of the codes item.
-- [ ] Client lifecycle path: approved-by-hand SQL is enough to start, but
-      decide now whether clients self-register (dynamic registration) or are
-      admin-created — the admin panel already has the pattern to extend.
+- [ ] Client management surface: RFC 7591 *initial* registration is landed
+      (`/register`, gated by single-use registration tokens minted out of
+      band), but there is no way to mint those tokens yet except hand SQL
+      (`CreateRegistrationToken` in `sql/registration_token.sql`), and RFC
+      7591's client management endpoint (GET/PUT/DELETE on the registration)
+      is absent — a client cannot rotate its secret or update its redirect
+      URIs without hand SQL. Decide whether management comes through the admin
+      panel, RFC 7592, or nothing at all. Whatever creates clients must keep
+      owning the invariants: exact redirect URIs, scopes inside the provider
+      vocabulary, and the public/secret pairing (the schema holds the pairing;
+      registration holds the rest).
 
 ### Authorization endpoint (`GET /authorize`)
 

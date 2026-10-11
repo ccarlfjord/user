@@ -25,6 +25,10 @@ import (
 
 type fakeStore struct {
 	getClientById                    func(context.Context, string) (repository.OauthClient, error)
+	createClient                     func(context.Context, repository.CreateClientParams) (repository.OauthClient, error)
+	createRegistrationToken          func(context.Context, repository.CreateRegistrationTokenParams) error
+	consumeRegistrationToken         func(context.Context, []byte) (repository.RegistrationToken, error)
+	deleteExpiredRegistrationTokens  func(context.Context) (int64, error)
 	createAuthorizationCode          func(context.Context, repository.CreateAuthorizationCodeParams) error
 	consumeAuthorizationCode         func(context.Context, []byte) (repository.AuthorizationCode, error)
 	deleteExpiredAuthorizationCodes  func(context.Context) (int64, error)
@@ -54,6 +58,25 @@ func (f fakeStore) GetClientById(ctx context.Context, clientID string) (reposito
 		return repository.OauthClient{}, pgx.ErrNoRows
 	}
 	return f.getClientById(ctx, clientID)
+}
+
+func (f fakeStore) CreateClient(ctx context.Context, arg repository.CreateClientParams) (repository.OauthClient, error) {
+	return f.createClient(ctx, arg)
+}
+
+func (f fakeStore) CreateRegistrationToken(ctx context.Context, arg repository.CreateRegistrationTokenParams) error {
+	return f.createRegistrationToken(ctx, arg)
+}
+
+func (f fakeStore) ConsumeRegistrationToken(ctx context.Context, tokenHash []byte) (repository.RegistrationToken, error) {
+	if f.consumeRegistrationToken == nil {
+		return repository.RegistrationToken{}, pgx.ErrNoRows
+	}
+	return f.consumeRegistrationToken(ctx, tokenHash)
+}
+
+func (f fakeStore) DeleteExpiredRegistrationTokens(ctx context.Context) (int64, error) {
+	return f.deleteExpiredRegistrationTokens(ctx)
 }
 
 func (f fakeStore) CreateAuthorizationCode(ctx context.Context, arg repository.CreateAuthorizationCodeParams) error {

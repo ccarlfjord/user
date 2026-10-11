@@ -41,10 +41,13 @@ func TestOpenIDConfiguration(t *testing.T) {
 	if len(got.SubjectTypesSupported) != 1 || got.SubjectTypesSupported[0] != "public" {
 		t.Fatalf("subject_types_supported = %v, want [public]", got.SubjectTypesSupported)
 	}
-	// The authorization endpoint is live; the ones that do not exist yet must
-	// not be advertised.
+	// The authorization and registration endpoints are live; the ones that do
+	// not exist yet must not be advertised.
 	if got.AuthorizationEndpoint != testIssuer+"/authorize" {
 		t.Fatalf("authorization_endpoint = %q, want %q", got.AuthorizationEndpoint, testIssuer+"/authorize")
+	}
+	if got.RegistrationEndpoint != testIssuer+"/register" {
+		t.Fatalf("registration_endpoint = %q, want %q", got.RegistrationEndpoint, testIssuer+"/register")
 	}
 	var raw map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {

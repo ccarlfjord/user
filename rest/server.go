@@ -24,6 +24,10 @@ import (
 type userStore interface {
 	GetUserByEmail(ctx context.Context, email string) (repository.User, error)
 	GetClientById(ctx context.Context, clientID string) (repository.OauthClient, error)
+	CreateClient(ctx context.Context, arg repository.CreateClientParams) (repository.OauthClient, error)
+	CreateRegistrationToken(ctx context.Context, arg repository.CreateRegistrationTokenParams) error
+	ConsumeRegistrationToken(ctx context.Context, tokenHash []byte) (repository.RegistrationToken, error)
+	DeleteExpiredRegistrationTokens(ctx context.Context) (int64, error)
 	GetUserById(ctx context.Context, id uuid.UUID) (repository.User, error)
 	CreateUser(ctx context.Context, arg repository.CreateUserParams) (repository.User, error)
 	CreateVerificationToken(ctx context.Context, arg repository.CreateVerificationTokenParams) error
@@ -87,6 +91,10 @@ func (c *controller) Run() error {
 	r.HandleFunc("/authorize/login", c.authorizeLoginHandler)
 	r.HandleFunc("/authorize/consent", c.authorizeConsentHandler)
 
+	// RFC 7591 dynamic client registration: a machine-to-machine POST, gated
+	// by a single-use registration token minted out-of-band.
+	r.HandleFunc("/register", c.registerHandler)
+
 	// OIDC discovery and the public key set. A relying party fetches these to
 	// learn the issuer and to verify tokens with the public key.
 	r.HandleFunc("/.well-known/openid-configuration", c.openIDConfiguration)
@@ -141,6 +149,11 @@ func (c *controller) purgeExpiredTokens() {
 			slog.Error("deleting expired authorization codes", "error", err)
 		} else if n > 0 {
 			slog.Debug("deleted expired authorization codes", "count", n)
+		}
+		if n, err := c.db.DeleteExpiredRegistrationTokens(ctx); err != nil {
+			slog.Error("deleting expired registration tokens", "error", err)
+		} else if n > 0 {
+			slog.Debug("deleted expired registration tokens", "count", n)
 		}
 	}
 

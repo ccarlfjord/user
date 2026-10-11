@@ -7,7 +7,9 @@ substrate. Discovery and the public key set are live
 (`/.well-known/openid-configuration`, `/.well-known/jwks.json`) and tokens are
 signed with ES256 (P-256). The authorization endpoint (`/authorize`) is live:
 request validation, an interactive login step, consent, and code issuance —
-see the OIDC section in `TODO.md`. `/token` and `/userinfo` are not built yet.
+and relying parties register themselves via RFC 7591 dynamic registration
+(`POST /register`, gated by a single-use registration token). See the OIDC
+section in `TODO.md`. `/token` and `/userinfo` are not built yet.
 
 ## Development
 
