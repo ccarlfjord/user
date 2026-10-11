@@ -13,6 +13,20 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+// The scope vocabulary this provider grants. `openid` is the only scope OIDC
+// itself requires; `email` maps to the email/email_verified claims. Discovery
+// advertises exactly this list, a client's allowed_scopes in the database may
+// never exceed it, and /authorize rejects any request outside it — so token
+// exchange never has to widen a grant. The list grows when a claim to hang a
+// new scope on actually exists.
+const (
+	ScopeOpenID = "openid"
+	ScopeEmail  = "email"
+)
+
+// supportedScopes is the vocabulary above in the order discovery lists it.
+var supportedScopes = []string{ScopeOpenID, ScopeEmail}
+
 // oidcIssuer is the public identifier for this provider. Every token's `iss`
 // must match it exactly, so it is resolved once at start-up from OIDC_ISSUER,
 // falling back to the same PUBLIC_BASE_URL that builds verification links.
@@ -50,7 +64,7 @@ func (c *controller) openIDConfiguration(w http.ResponseWriter, r *http.Request)
 		JWKSURI:                          c.issuer + "/.well-known/jwks.json",
 		IDTokenSigningAlgValuesSupported: []string{jwt.SigningMethodES256.Alg()},
 		SubjectTypesSupported:            []string{"public"},
-		ScopesSupported:                  []string{"openid", "email"},
+		ScopesSupported:                  supportedScopes,
 		ClaimsSupported:                  []string{"sub", "email"},
 	})
 }

@@ -10,6 +10,17 @@ import (
 	"github.com/google/uuid"
 )
 
+type OauthClient struct {
+	ClientID         string    `json:"client_id"`
+	ClientSecretHash []byte    `json:"client_secret_hash"`
+	IsPublic         bool      `json:"is_public"`
+	Name             string    `json:"name"`
+	RedirectUris     []string  `json:"redirect_uris"`
+	AllowedScopes    []string  `json:"allowed_scopes"`
+	Active           bool      `json:"active"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
 type PasswordResetToken struct {
 	TokenHash []byte    `json:"token_hash"`
 	UserID    uuid.UUID `json:"user_id"`

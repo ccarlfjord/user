@@ -45,44 +45,137 @@ and validate the result.
       a key after that window, and a `sessionKey` that verifies against the old key during the overlap.
       Keeping a retired key published indefinitely is harmless at this scale, so the time filter is tidy-up,
       not correctness (see the P1 signing-key item too).
-- [ ] Clients: no registry of relying parties — no `client_id`, no
-      `client_secret`, no redirect URI allowlist, no scopes anywhere in the
-      schema. `/authorize` cannot know where a user may be sent back to until
-      clients are approved (or dynamically registered).
-- [ ] Authorization endpoint: no `/authorize`. It needs `response_type=code`,
-      `client_id`, exact `redirect_uri` validation against the client, `scope`,
-      `state`, `nonce`, and a browser login/consent step. Login today is the
-      JSON `POST /v1/login` (`rest/user.go`) and the only HTML login form is the
-      admin panel's (`/admin/login`, `rest/admin.go`), so the interactive flow
-      does not exist.
-- [ ] Authorization codes and PKCE: no code table and no `code_challenge`/
-      `code_verifier`. Codes must be single-use, short-lived, bound to the
-      client, redirect URI, and nonce, and consumed atomically — the pattern
-      `ConsumeRefreshToken`/`ConsumePasswordResetToken` already follow.
-- [ ] Token endpoint: no `/token`. It has to exchange an authorization code
-      (and a refresh token) for an ID token and an access token, with client
-      authentication. `refresh` (`rest/user.go`) already does single-use,
-      rotating, epoch-checked refresh, but against this API's own
-      `SessionResponse`, not an OIDC client.
-- [ ] ID token: absent. `mintSession` (`rest/user.go`) produces an
-      access-token-shaped JWT with a fixed `aud` (`sessionAudience`) and no
-      `nonce`, `auth_time`, `email`, or `email_verified`. An ID token's `aud` is
-      the client id and the code flow requires `nonce`.
-- [ ] UserInfo: no `/userinfo` endpoint reading the access token and returning
-      `sub` plus the granted claims (at least `email`, `email_verified`).
-- [ ] `email_verified`: `users` has `active` (`000001`), not an email
-      verification flag, so the `email` claim has nothing truthful to say about
-      whether the address was confirmed — even though signup already issues a
-      verification token (`verification_tokens`, `000003`).
+Ordered so each item builds on the ones before it: schema first, then the
+endpoints in the order a relying party walks the flow (discover → authorize →
+token → userinfo → logout).
+
+### Clients (schema + admin)
+
+- [x] `oauth_clients` table (migration `000008`): `client_id` (random, not a secret),
+      `client_secret_hash` (argon2id, like `users`), `name`, `redirect_uris`,
+      `allowed_scopes`, `active`. Public (`code` + PKCE) vs confidential
+      (`client_secret`) is an explicit `is_public` flag so `/token` knows whether
+      to authenticate. Two CHECK constraints hold the invariants: a client with an
+      empty `redirect_uris` array cannot be stored (`cardinality()`, not
+      `array_length()` — the latter is NULL for an empty array and a NULL CHECK
+      passes), and a public client cannot carry a secret hash (nor a confidential
+      one lack it). `CreateClient`/`GetClientById`/`DeleteClient` in `sql/client.sql`;
+      nothing reads them yet until `/authorize` lands.
+- [ ] Redirect URI rules, redirect-time half: storage is exact-match strings
+      (`TEXT[]`, no wildcards, done with the schema); the character-by-character
+      comparison against the `redirect_uri` request parameter is `/authorize`
+      handler work and lands with it.
+- [x] Scope vocabulary: `ScopeOpenID`/`ScopeEmail` constants in `rest/oidc.go`,
+      and discovery's `scopes_supported` now lists exactly that shared list rather
+      than an inline literal. `profile` comes when a `profile` claim exists to hang
+      it on. Storing the grant per authorization is part of the codes item.
+- [ ] Client lifecycle path: approved-by-hand SQL is enough to start, but
+      decide now whether clients self-register (dynamic registration) or are
+      admin-created — the admin panel already has the pattern to extend.
+
+### Authorization endpoint (`GET /authorize`)
+
+- [ ] Request validation: `client_id` must resolve and be active,
+      `redirect_uri` must exact-match, `response_type=code` (only this),
+      `code_challenge`/`method` well-formed (S256 only). Errors go to the
+      redirect URI with `error=invalid_request` *only after* the redirect URI
+      is validated; before that, render an error page — never redirect to an
+      unvalidated URL.
+- [ ] Interactive login step: an HTML form, not the JSON `POST /v1/login`
+      (`rest/user.go`) and not the admin panel's (`/admin/login`). Reuse the
+      session cookie path if a valid session already exists — then `/authorize`
+      is one click, and the browser flow can ride the panel's session.
+- [ ] Consent step: show the client name and the scopes requested; record the
+      user's grant (or approval memory) before issuing the code. Can ship as
+      an always-ask page first, remember-me later.
+- [ ] Issue the code: 302 to `redirect_uri?code=...&state=...&iss=...`.
+      `state` is echoed, not stored server-side; `nonce` is stored with the
+      code for the ID token.
+
+### Authorization codes
+
+- [ ] `authorization_codes` table (migration): hash of the code, `client_id`,
+      `user_id`, `redirect_uri`, `scope`, `nonce`, `code_challenge`,
+      `session_epoch`, `expires_at` (short — minutes), consumed flag.
+- [ ] Atomic single-use consumption: `DELETE ... RETURNING` like
+      `ConsumeRefreshToken`/`ConsumePasswordResetToken`, so a replayed code
+      loses to the concurrent request. Also revoke the tokens issued from a
+      replayed code once one exchange wins (RFC 6749 §4.1.2). Membership of
+      the code's `session_epoch` ties retirement to password changes.
+- [ ] PKCE verification at the token endpoint: `S256(code_verifier)` equals
+      the stored challenge, else `invalid_grant`. Required for public clients.
+
+### Token endpoint (`POST /token`)
+
+- [ ] Client authentication: confidential clients authenticate with the
+      secret (basic auth or body — pick and pin); public clients are
+      identified by `client_id` only and must have passed PKCE.
+- [ ] `authorization_code` grant: validate client + redirect URI match the
+      code, consume the code atomically, issue the ID + access + refresh
+      tokens below.
+- [ ] `refresh_token` grant: `refresh` (`rest/user.go`) already does
+      single-use, rotating, epoch-checked refresh — but against this API's own
+      `SessionResponse`. Extend the same pattern to the OIDC client: keep the
+      granted scope, refresh rotation stays mandatory.
+
+### ID token
+
+- [ ] Mint at `/token`: `sub` = user id, `aud` = client id (not
+      `sessionAudience`), `nonce` echoed from the code, `iss` = the resolved
+      issuer, `auth_time` = when the login step happened, `acr`, plus `kid`
+      (already set by `mintSession`).
+- [ ] Claim shaping: `email`/`email_verified` only when `email` scope was
+      granted; `profile` claims likewise. `mintSession` currently emits an
+      access-token-shaped JWT with a fixed `aud` — it stays the internal
+      session, the ID token is a separate mint.
+
+### Access tokens
+
 - [ ] Session/access-token split: the same ES256 JWT gates this service's own
-      API (`requireSession`, `rest/server.go`) and would be what is handed to a
-      relying party. OIDC wants a short-lived access token whose audience is the
-      resource server and an ID token for the client, distinct from the internal
-      admin session cookie the panel uses. The key is now shared too — internal
-      sessions and future ID tokens are signed with the same one.
-- [ ] Logout and revocation: no `end_session_endpoint`, and no `/introspect`
-      or `/revoke`. Without a `jti` (below) there is no per-session revocation,
-      and there is no RP-initiated logout at all.
+      API (`requireSession`, `rest/server.go`) and today would be what is
+      handed to a relying party. OIDC wants a short-lived access token whose
+      audience is the resource server (here: `/userinfo`) and an ID token for
+      the client, distinct from the internal admin session cookie. The signing
+      key is shared for now — fine at this scale; the split is about `aud` and
+      lifetime, not keys.
+- [ ] Access-token format decision: an opaque random value (like refresh
+      tokens — no revocation problem, needs `/introspect` for RPs) or a JWT
+      (self-contained, but then revocation needs the `jti` work). The session
+      item above depends on this choice.
+- [ ] `/userinfo`: reads the access token, returns `sub` plus the granted
+      claims (at least `email`, `email_verified`) — shape depends on the
+      format decision above.
+- [ ] `email_verified`: `users` has `active` (`000001`), not an email
+      verification flag, so the `email` claim has nothing truthful to say
+      about whether the address was confirmed — even though signup already
+      issues a verification token (`verification_tokens`, `000003`). Add the
+      column, set it in the verify flow, only then emit the claim.
+
+### Logout, revocation, rotation
+
+- [ ] `jti` on sessions: without it there is no per-session revocation, and
+      the sessions-admin-page item (P2) stays blocked too. Decide the
+      revocation mechanism first — everything below hangs off it.
+- [ ] `/revoke`: accept a refresh or access token from an authenticated
+      client; per RFC 7009 the response is `200` whether or not the token was
+      live.
+- [ ] `/introspect`: needed for RPs only if access tokens are opaque (above).
+- [ ] `end_session_endpoint` (RP-initiated logout): clears the browser
+      session and, if `jti`/epoch work exists, retires the tokens minted in
+      that login.
+- [ ] Multi-key rotation: one key exists and the JWKS advertises one `kid`.
+      Rotation is overlap-only: generate a new key and sign with it, publish
+      both public keys in the JWKS, and drop the old one only once the
+      longest signed-token lifetime has passed since it was last used to
+      sign. Nothing is revoked or deleted: a token whose `kid` is no longer
+      advertised has already expired. The bound is `sessionTTL` (1h, plus a
+      clock-skew margin), because refresh tokens are opaque random values and
+      are not signed. Needs multiple key rows selected by `created_at` (the
+      fixed `oidc_signing_key` name holds only one), a JWKS that hides a key
+      after that window, and a `sessionKey` that verifies against the old key
+      during the overlap. Keeping a retired key published indefinitely is
+      harmless at this scale, so the time filter is tidy-up, not correctness
+      (see the P1 signing-key item too).
 
 ## P0 — handlers
 
