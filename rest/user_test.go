@@ -3,6 +3,9 @@ package rest
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"io"
@@ -118,14 +121,27 @@ func (f fakeStore) SearchUsers(ctx context.Context, query string) ([]repository.
 	return f.searchUsers(ctx, query)
 }
 
-// testSessionKey is the HMAC key newTestController signs and validates
-// sessions with.
-const testSessionKey = "test-signing-key"
+// testIssuer is the OIDC issuer identifier newTestController advertises.
+const testIssuer = "https://issuer.example.com"
+
+// testSigningKey is the ES256 key every test controller signs and validates
+// with. It is generated once: the key is immutable, and a per-test key would
+// only make the signing helpers more awkward.
+var testSigningKey = mustGenerateTestKey()
+
+func mustGenerateTestKey() *ecdsa.PrivateKey {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	return key
+}
 
 func newTestController(store userStore) *controller {
 	return &controller{
-		db:           store,
-		sessionToken: []byte(testSessionKey),
+		db:      store,
+		oidcKey: testSigningKey,
+		issuer:  testIssuer,
 	}
 }
 
@@ -463,7 +479,7 @@ func TestRefreshRotatesTokenAndMintsSession(t *testing.T) {
 	// The session minted from the old refresh token has to be usable as-is.
 	claims := new(sessionClaims)
 	if _, err := jwt.ParseWithClaims(resp.Session, claims, c.sessionKey,
-		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithValidMethods([]string{jwt.SigningMethodES256.Alg()}),
 		jwt.WithIssuer(sessionIssuer),
 		jwt.WithAudience(sessionAudience),
 	); err != nil {
@@ -863,10 +879,10 @@ func mintedClaims(sub string, epoch int32) sessionClaims {
 }
 
 // signClaims signs an arbitrary claim set with key.
-func signClaims(t *testing.T, key []byte, claims sessionClaims) string {
+func signClaims(t *testing.T, key *ecdsa.PrivateKey, claims sessionClaims) string {
 	t.Helper()
 
-	signed, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(key)
+	signed, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(key)
 	if err != nil {
 		t.Fatalf("sign session: %v", err)
 	}
@@ -879,7 +895,7 @@ func authRequest(t *testing.T, method, target string, user repository.User) *htt
 	t.Helper()
 
 	req := httptest.NewRequest(method, target, nil)
-	req.Header.Set("Authorization", "Bearer "+signClaims(t, []byte(testSessionKey), mintedClaims(user.ID.String(), user.SessionEpoch)))
+	req.Header.Set("Authorization", "Bearer "+signClaims(t, testSigningKey, mintedClaims(user.ID.String(), user.SessionEpoch)))
 	return req
 }
 
@@ -911,7 +927,8 @@ func TestRequireSessionRejectsInvalidTokens(t *testing.T) {
 			return account, nil
 		},
 	})
-	key := []byte(testSessionKey)
+	key := testSigningKey
+	otherKey := mustGenerateTestKey()
 	sub := uuid.New().String()
 
 	// vary returns the expected claim set with one field changed.
@@ -921,13 +938,14 @@ func TestRequireSessionRejectsInvalidTokens(t *testing.T) {
 		return claims
 	}
 
-	// Same key, different algorithm: must not be accepted even though the
-	// signature would verify under a non-pinned HMAC check.
-	hs512 := func() string {
-		token := jwt.NewWithClaims(jwt.SigningMethodHS512, mintedClaims(sub, 0))
-		signed, err := token.SignedString(key)
+	// A token signed with a different algorithm and a key the caller controls:
+	// verification is pinned to ES256, so an HMAC token is refused before the
+	// key function is even consulted.
+	hs256 := func() string {
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, mintedClaims(sub, 0))
+		signed, err := token.SignedString([]byte("attacker-controlled-key"))
 		if err != nil {
-			t.Fatalf("sign hs512 token: %v", err)
+			t.Fatalf("sign hs256 token: %v", err)
 		}
 		return signed
 	}()
@@ -950,7 +968,7 @@ func TestRequireSessionRejectsInvalidTokens(t *testing.T) {
 		{"scheme without token", "Bearer"},
 		{"wrong scheme", "Basic " + signClaims(t, key, mintedClaims(sub, 0))},
 		{"malformed token", "Bearer not-a-jwt"},
-		{"signed with another key", "Bearer " + signClaims(t, []byte("other-signing-key"), mintedClaims(sub, 0))},
+		{"signed with another key", "Bearer " + signClaims(t, otherKey, mintedClaims(sub, 0))},
 		{"expired", "Bearer " + signClaims(t, key, vary(func(c *sessionClaims) {
 			c.ExpiresAt = jwt.NewNumericDate(expired)
 		}))},
@@ -975,7 +993,7 @@ func TestRequireSessionRejectsInvalidTokens(t *testing.T) {
 		{"no session epoch", "Bearer " + signClaims(t, key, vary(func(c *sessionClaims) {
 			c.SessionEpoch = nil
 		}))},
-		{"hs512", "Bearer " + hs512},
+		{"hs256", "Bearer " + hs256},
 		{"alg none", "Bearer " + none},
 		{"empty subject", "Bearer " + signClaims(t, key, vary(func(c *sessionClaims) {
 			c.Subject = ""
@@ -1131,7 +1149,7 @@ func TestRequireSessionHonoursSessionEpoch(t *testing.T) {
 			})
 
 			req := httptest.NewRequest(http.MethodGet, "/v1/user/"+caller.ID.String(), nil)
-			req.Header.Set("Authorization", "Bearer "+signClaims(t, []byte(testSessionKey), tt.claims))
+			req.Header.Set("Authorization", "Bearer "+signClaims(t, testSigningKey, tt.claims))
 			rec := httptest.NewRecorder()
 			handler(rec, req)
 

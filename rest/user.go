@@ -575,7 +575,7 @@ func (c *controller) login(w http.ResponseWriter, r *http.Request) {
 func (c *controller) mintSession(user repository.User) (string, error) {
 	now := time.Now()
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, sessionClaims{
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, sessionClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    sessionIssuer,
 			Subject:   user.ID.String(),
@@ -586,7 +586,7 @@ func (c *controller) mintSession(user repository.User) (string, error) {
 		SessionEpoch: &user.SessionEpoch,
 	})
 
-	return token.SignedString(c.sessionToken)
+	return token.SignedString(c.oidcKey)
 }
 
 // issueRefreshToken stores a new refresh token for user and returns the value

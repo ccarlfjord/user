@@ -75,7 +75,7 @@ func TestCookieSessionAuthenticatesAdminPanel(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
 	req.AddCookie(&http.Cookie{
 		Name:  sessionCookieName,
-		Value: signClaims(t, []byte(testSessionKey), mintedClaims(admin.ID.String(), admin.SessionEpoch)),
+		Value: signClaims(t, testSigningKey, mintedClaims(admin.ID.String(), admin.SessionEpoch)),
 	})
 	rec := httptest.NewRecorder()
 	adminRoute(c, "/admin")(rec, req)

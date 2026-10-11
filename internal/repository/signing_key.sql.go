@@ -9,19 +9,27 @@ import (
 	"context"
 )
 
-const getOrCreateSigningKey = `-- name: GetOrCreateSigningKey :one
+const createSigningKey = `-- name: CreateSigningKey :exec
 INSERT INTO signing_keys(name, value) VALUES($1, $2)
-ON CONFLICT (name) DO UPDATE SET value = signing_keys.value
-RETURNING name, value, created_at
+ON CONFLICT (name) DO NOTHING
 `
 
-type GetOrCreateSigningKeyParams struct {
+type CreateSigningKeyParams struct {
 	Name  string `json:"name"`
 	Value []byte `json:"value"`
 }
 
-func (q *Queries) GetOrCreateSigningKey(ctx context.Context, arg GetOrCreateSigningKeyParams) (SigningKey, error) {
-	row := q.db.QueryRow(ctx, getOrCreateSigningKey, arg.Name, arg.Value)
+func (q *Queries) CreateSigningKey(ctx context.Context, arg CreateSigningKeyParams) error {
+	_, err := q.db.Exec(ctx, createSigningKey, arg.Name, arg.Value)
+	return err
+}
+
+const getSigningKey = `-- name: GetSigningKey :one
+SELECT name, value, created_at FROM signing_keys WHERE name = $1
+`
+
+func (q *Queries) GetSigningKey(ctx context.Context, name string) (SigningKey, error) {
+	row := q.db.QueryRow(ctx, getSigningKey, name)
 	var i SigningKey
 	err := row.Scan(&i.Name, &i.Value, &i.CreatedAt)
 	return i, err

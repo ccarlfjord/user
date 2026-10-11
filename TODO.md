@@ -13,6 +13,69 @@ Ordered by priority; every item is grounded in the code as it stands.
 - [x] `000004_session_invalidation` is applied to the local database by hand, as every migration is until a
       runner exists (see the P1 item); the `down` really reverses the `up`, unlike `000002`/`000003`.
 
+## P0 — OIDC provider
+
+This service exists to be an OpenID Connect provider. The account, session, and
+token machinery above is the substrate; everything below is what still stands
+between it and a relying party being able to discover it, authenticate a user,
+and validate the result.
+
+- [x] Discovery: `GET /.well-known/openid-configuration` (`rest/oidc.go`) serves the document a relying
+      party fetches first: `issuer`, `jwks_uri`, `id_token_signing_alg_values_supported` (`["ES256"]`),
+      `subject_types_supported` (`["public"]`), `scopes_supported`, and `claims_supported`. The
+      authorization/token/userinfo endpoints are deliberately absent until they exist rather than advertised
+      as 404s. The issuer is resolved once at start-up by `oidcIssuer` from `OIDC_ISSUER`, falling back to
+      `PUBLIC_BASE_URL`, so every future `iss` can match one configured URL.
+- [x] JWKS and asymmetric signing: the service signs with a persisted ES256 (P-256) key. `loadSigningKey`
+      (`main.go`) reads the `oidc_signing_key` row, generates a key only on first boot with a race-safe
+      `CreateSigningKey` (`ON CONFLICT DO NOTHING`) plus read-back, and refuses a stored key that is not
+      P-256. `GET /.well-known/jwks.json` publishes its public half as an EC JWK (`kty`, `crv`, `x`, `y`,
+      `use: sig`, `alg: ES256`) whose `kid` is the RFC 7638 thumbprint (`keyID`, `rest/oidc.go`), so an RP can
+      verify without holding anything that mints. Sessions moved off HS256 with it: `mintSession` signs ES256
+      and `requireSession`/`sessionKey` verify against the public key, pinned to that one algorithm.
+- [ ] Signing-key rotation: one key exists and the JWKS advertises one `kid`, and `mintSession` does not put a
+      `kid` in the JWT header, so a relying party has nothing to select a key by. Add the `kid` header, a
+      second key row, and a JWKS that publishes both during an overlap window with a retirement path for the
+      old key (see the P1 signing-key item too).
+- [ ] Clients: no registry of relying parties — no `client_id`, no
+      `client_secret`, no redirect URI allowlist, no scopes anywhere in the
+      schema. `/authorize` cannot know where a user may be sent back to until
+      clients are approved (or dynamically registered).
+- [ ] Authorization endpoint: no `/authorize`. It needs `response_type=code`,
+      `client_id`, exact `redirect_uri` validation against the client, `scope`,
+      `state`, `nonce`, and a browser login/consent step. Login today is the
+      JSON `POST /v1/login` (`rest/user.go`) and the only HTML login form is the
+      admin panel's (`/admin/login`, `rest/admin.go`), so the interactive flow
+      does not exist.
+- [ ] Authorization codes and PKCE: no code table and no `code_challenge`/
+      `code_verifier`. Codes must be single-use, short-lived, bound to the
+      client, redirect URI, and nonce, and consumed atomically — the pattern
+      `ConsumeRefreshToken`/`ConsumePasswordResetToken` already follow.
+- [ ] Token endpoint: no `/token`. It has to exchange an authorization code
+      (and a refresh token) for an ID token and an access token, with client
+      authentication. `refresh` (`rest/user.go`) already does single-use,
+      rotating, epoch-checked refresh, but against this API's own
+      `SessionResponse`, not an OIDC client.
+- [ ] ID token: absent. `mintSession` (`rest/user.go`) produces an
+      access-token-shaped JWT with a fixed `aud` (`sessionAudience`) and no
+      `nonce`, `auth_time`, `email`, or `email_verified`. An ID token's `aud` is
+      the client id and the code flow requires `nonce`.
+- [ ] UserInfo: no `/userinfo` endpoint reading the access token and returning
+      `sub` plus the granted claims (at least `email`, `email_verified`).
+- [ ] `email_verified`: `users` has `active` (`000001`), not an email
+      verification flag, so the `email` claim has nothing truthful to say about
+      whether the address was confirmed — even though signup already issues a
+      verification token (`verification_tokens`, `000003`).
+- [ ] Session/access-token split: the same ES256 JWT gates this service's own
+      API (`requireSession`, `rest/server.go`) and would be what is handed to a
+      relying party. OIDC wants a short-lived access token whose audience is the
+      resource server and an ID token for the client, distinct from the internal
+      admin session cookie the panel uses. The key is now shared too — internal
+      sessions and future ID tokens are signed with the same one.
+- [ ] Logout and revocation: no `end_session_endpoint`, and no `/introspect`
+      or `/revoke`. Without a `jti` (below) there is no per-session revocation,
+      and there is no RP-initiated logout at all.
+
 ## P0 — handlers
 
 - [x] `deleteUser` (`rest/user.go`) implemented on `DELETE /v1/user`: body is `{"id","email"}`, ID takes
@@ -127,9 +190,10 @@ Ordered by priority; every item is grounded in the code as it stands.
 - [x] Expired token janitor: a daily `purgeExpiredTokens` goroutine deletes expired `refresh_tokens`,
       `verification_tokens` and `password_reset_tokens` (`expires_at < now()`), so abandoned signups and
       unconsumed refresh/reset tokens no longer accumulate. Failure is logged and retried on the next tick.
-- [ ] Signing key handling: `loadSigningKey` generates 32 random bytes on every boot and relies on
-      `GetOrCreateSigningKey`'s `ON CONFLICT ... DO UPDATE`. There is no `kid`/rotation versioning; simplify the
-      upsert to `DO NOTHING RETURNING`.
+- [x] Signing key handling: `loadSigningKey` no longer generates a fresh secret each boot. It reads the
+      `oidc_signing_key` row, creates one only when absent (`GetSigningKey`/`CreateSigningKey`,
+      `sql/signing_key.sql`), and the `ON CONFLICT ... DO UPDATE` self-write is gone; `kid` is derived from
+      the public key (RFC 7638) instead of stored. Rotation remains in the OIDC section.
 
 ## P1 — runtime
 
@@ -148,8 +212,8 @@ Ordered by priority; every item is grounded in the code as it stands.
 
 ## P2 — hygiene
 
-- [ ] `README.md` is empty. Document `DATABASE_URL`, `LOGLEVEL`, `PUBLIC_BASE_URL`, the routes, and the
-      migrate/run steps.
+- [ ] `README.md` documents the Podman dev container (e.g. `postgres-dev`); still to add `DATABASE_URL`,
+      `LOGLEVEL`, `PUBLIC_BASE_URL`, the routes, and the migrate/run steps.
 - [ ] `main_test.go` requires a live Postgres and defaults to `postgresql://postgres:postgres@localhost:5432`
       with no `t.Skip`, so any CI job needs a database service.
 - [ ] No CI workflow and no Dockerfile.

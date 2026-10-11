@@ -2,6 +2,7 @@ package rest
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,8 +44,9 @@ type userStore interface {
 }
 
 type controller struct {
-	db           userStore
-	sessionToken []byte
+	db      userStore
+	oidcKey *ecdsa.PrivateKey
+	issuer  string
 }
 
 type User struct {
@@ -54,10 +56,11 @@ type User struct {
 	Admin  bool      `json:"admin"`
 }
 
-func New(pool *pgxpool.Pool, sessionToken []byte) *controller {
+func New(pool *pgxpool.Pool, oidcKey *ecdsa.PrivateKey) *controller {
 	return &controller{
-		db:           repository.New(pool),
-		sessionToken: sessionToken,
+		db:      repository.New(pool),
+		oidcKey: oidcKey,
+		issuer:  oidcIssuer(),
 	}
 }
 
@@ -72,6 +75,11 @@ func (c *controller) Run() error {
 	r.HandleFunc("/v1/password/forgot", c.forgotPasswordHandler)
 	r.HandleFunc("/v1/password/reset", c.resetPasswordHandler)
 	r.HandleFunc("/signup", c.signupPage)
+
+	// OIDC discovery and the public key set. A relying party fetches these to
+	// learn the issuer and to verify tokens with the public key.
+	r.HandleFunc("/.well-known/openid-configuration", c.openIDConfiguration)
+	r.HandleFunc("/.well-known/jwks.json", c.jwks)
 
 	// The admin panel is server-rendered HTML behind requireSession plus an
 	// admin check, and its actions are htmx posts that return table fragments.
@@ -293,7 +301,7 @@ func (c *controller) requireSession(next http.HandlerFunc) http.HandlerFunc {
 
 		claims := new(sessionClaims)
 		_, err := jwt.ParseWithClaims(raw, claims, c.sessionKey,
-			jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+			jwt.WithValidMethods([]string{jwt.SigningMethodES256.Alg()}),
 			jwt.WithExpirationRequired(),
 			jwt.WithIssuer(sessionIssuer),
 			jwt.WithAudience(sessionAudience),
@@ -362,14 +370,17 @@ func mayAccessUser(caller repository.User, target uuid.UUID) bool {
 	return caller.Admin || caller.ID == target
 }
 
-// sessionKey returns the HMAC secret only for HS256 tokens. The signing method
-// is pinned so a token cannot be verified with an algorithm the caller chose
-// (alg confusion / "none").
+// sessionKey returns the public half of the signing key, and only for ES256
+// tokens. The signing method is pinned so a token cannot be verified with an
+// algorithm the caller chose (alg confusion / "none").
 func (c *controller) sessionKey(t *jwt.Token) (any, error) {
-	if m, ok := t.Method.(*jwt.SigningMethodHMAC); !ok || m.Alg() != jwt.SigningMethodHS256.Alg() {
+	if m, ok := t.Method.(*jwt.SigningMethodECDSA); !ok || m.Alg() != jwt.SigningMethodES256.Alg() {
 		return nil, fmt.Errorf("unexpected signing method %q", t.Method.Alg())
 	}
-	return c.sessionToken, nil
+	if c.oidcKey == nil {
+		return nil, errors.New("no signing key loaded")
+	}
+	return &c.oidcKey.PublicKey, nil
 }
 
 // bearerToken extracts the token from an Authorization header value.

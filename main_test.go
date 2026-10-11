@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
 	"os"
 	"testing"
@@ -64,5 +68,55 @@ func TestCreateUser(t *testing.T) {
 	}
 	if err := pass.Validate("test123", user.HashedPassword, user.Salt); err != nil {
 		t.Error(err)
+	}
+}
+
+// TestParseSigningKey covers start-up decoding of the stored key, because a
+// malformed or wrong-curve row must stop the service rather than produce
+// tokens nobody can verify.
+func TestParseSigningKey(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parsed, err := parseSigningKey(der)
+	if err != nil {
+		t.Fatalf("P-256 key rejected: %v", err)
+	}
+	if !parsed.Equal(key) {
+		t.Fatal("parsed key differs from the stored one")
+	}
+
+	p384, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p384der, err := x509.MarshalPKCS8PrivateKey(p384)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseSigningKey(p384der); err == nil {
+		t.Fatal("a P-384 key was accepted, want a P-256-only refusal")
+	}
+
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edDER, err := x509.MarshalPKCS8PrivateKey(edKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseSigningKey(edDER); err == nil {
+		t.Fatal("a non-ECDSA key was accepted")
+	}
+
+	if _, err := parseSigningKey([]byte("not a key")); err == nil {
+		t.Fatal("garbage was accepted as a signing key")
 	}
 }
