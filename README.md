@@ -5,8 +5,9 @@ sessions, and is the identity source other services and relying parties are
 meant to sign in through. The account, session, and token machinery is the
 substrate. Discovery and the public key set are live
 (`/.well-known/openid-configuration`, `/.well-known/jwks.json`) and tokens are
-signed with ES256 (P-256); the rest of the OIDC surface (`/authorize`,
-`/token`, `/userinfo`) is not built yet — see the OIDC section in `TODO.md`.
+signed with ES256 (P-256). The authorization endpoint (`/authorize`) is live:
+request validation, an interactive login step, consent, and code issuance —
+see the OIDC section in `TODO.md`. `/token` and `/userinfo` are not built yet.
 
 ## Development
 

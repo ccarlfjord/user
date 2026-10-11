@@ -10,6 +10,19 @@ import (
 	"github.com/google/uuid"
 )
 
+type AuthorizationCode struct {
+	CodeHash      []byte    `json:"code_hash"`
+	ClientID      string    `json:"client_id"`
+	UserID        uuid.UUID `json:"user_id"`
+	RedirectUri   string    `json:"redirect_uri"`
+	Scope         string    `json:"scope"`
+	Nonce         string    `json:"nonce"`
+	CodeChallenge string    `json:"code_challenge"`
+	SessionEpoch  int32     `json:"session_epoch"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
 type OauthClient struct {
 	ClientID         string    `json:"client_id"`
 	ClientSecretHash []byte    `json:"client_secret_hash"`

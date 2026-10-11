@@ -38,12 +38,13 @@ func oidcIssuer() string {
 }
 
 // oidcConfiguration is the OpenID Connect Discovery document. It carries only
-// the fields this service can answer for today: the issuer, the key set, and
-// the ES256 signing method. The authorization, token, and userinfo endpoints
-// join it when they exist — advertising a URL that still 404s would mislead a
-// relying party, so they are deliberately absent.
+// the fields this service can answer for today: the issuer, the key set, the
+// ES256 signing method, and the authorization endpoint. The token and userinfo
+// endpoints join when they exist — advertising a URL that still 404s would
+// mislead a relying party, so they are deliberately absent.
 type oidcConfiguration struct {
 	Issuer                           string   `json:"issuer"`
+	AuthorizationEndpoint            string   `json:"authorization_endpoint"`
 	JWKSURI                          string   `json:"jwks_uri"`
 	IDTokenSigningAlgValuesSupported []string `json:"id_token_signing_alg_values_supported"`
 	SubjectTypesSupported            []string `json:"subject_types_supported"`
@@ -61,6 +62,7 @@ func (c *controller) openIDConfiguration(w http.ResponseWriter, r *http.Request)
 
 	JSON(w, http.StatusOK, oidcConfiguration{
 		Issuer:                           c.issuer,
+		AuthorizationEndpoint:            c.issuer + "/authorize",
 		JWKSURI:                          c.issuer + "/.well-known/jwks.json",
 		IDTokenSigningAlgValuesSupported: []string{jwt.SigningMethodES256.Alg()},
 		SubjectTypesSupported:            []string{"public"},

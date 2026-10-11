@@ -24,6 +24,10 @@ import (
 )
 
 type fakeStore struct {
+	getClientById                    func(context.Context, string) (repository.OauthClient, error)
+	createAuthorizationCode          func(context.Context, repository.CreateAuthorizationCodeParams) error
+	consumeAuthorizationCode         func(context.Context, []byte) (repository.AuthorizationCode, error)
+	deleteExpiredAuthorizationCodes  func(context.Context) (int64, error)
 	getUserByEmail                   func(context.Context, string) (repository.User, error)
 	getUserById                      func(context.Context, uuid.UUID) (repository.User, error)
 	createUser                       func(context.Context, repository.CreateUserParams) (repository.User, error)
@@ -45,11 +49,33 @@ type fakeStore struct {
 	searchUsers                      func(context.Context, string) ([]repository.User, error)
 }
 
+func (f fakeStore) GetClientById(ctx context.Context, clientID string) (repository.OauthClient, error) {
+	if f.getClientById == nil {
+		return repository.OauthClient{}, pgx.ErrNoRows
+	}
+	return f.getClientById(ctx, clientID)
+}
+
+func (f fakeStore) CreateAuthorizationCode(ctx context.Context, arg repository.CreateAuthorizationCodeParams) error {
+	return f.createAuthorizationCode(ctx, arg)
+}
+
+func (f fakeStore) ConsumeAuthorizationCode(ctx context.Context, codeHash []byte) (repository.AuthorizationCode, error) {
+	return f.consumeAuthorizationCode(ctx, codeHash)
+}
+
+func (f fakeStore) DeleteExpiredAuthorizationCodes(ctx context.Context) (int64, error) {
+	return f.deleteExpiredAuthorizationCodes(ctx)
+}
+
 func (f fakeStore) GetUserByEmail(ctx context.Context, email string) (repository.User, error) {
 	return f.getUserByEmail(ctx, email)
 }
 
 func (f fakeStore) GetUserById(ctx context.Context, id uuid.UUID) (repository.User, error) {
+	if f.getUserById == nil {
+		return repository.User{}, pgx.ErrNoRows
+	}
 	return f.getUserById(ctx, id)
 }
 

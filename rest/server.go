@@ -23,6 +23,7 @@ import (
 // interface so handlers can be tested without a live database.
 type userStore interface {
 	GetUserByEmail(ctx context.Context, email string) (repository.User, error)
+	GetClientById(ctx context.Context, clientID string) (repository.OauthClient, error)
 	GetUserById(ctx context.Context, id uuid.UUID) (repository.User, error)
 	CreateUser(ctx context.Context, arg repository.CreateUserParams) (repository.User, error)
 	CreateVerificationToken(ctx context.Context, arg repository.CreateVerificationTokenParams) error
@@ -35,6 +36,9 @@ type userStore interface {
 	ConsumeRefreshToken(ctx context.Context, tokenHash []byte) (repository.RefreshToken, error)
 	DeleteExpiredRefreshTokens(ctx context.Context) (int64, error)
 	DeleteExpiredVerificationTokens(ctx context.Context) (int64, error)
+	CreateAuthorizationCode(ctx context.Context, arg repository.CreateAuthorizationCodeParams) error
+	ConsumeAuthorizationCode(ctx context.Context, codeHash []byte) (repository.AuthorizationCode, error)
+	DeleteExpiredAuthorizationCodes(ctx context.Context) (int64, error)
 	CreatePasswordResetToken(ctx context.Context, arg repository.CreatePasswordResetTokenParams) error
 	ConsumePasswordResetToken(ctx context.Context, tokenHash []byte) (repository.PasswordResetToken, error)
 	DeletePasswordResetTokensForUser(ctx context.Context, userID uuid.UUID) error
@@ -75,6 +79,13 @@ func (c *controller) Run() error {
 	r.HandleFunc("/v1/password/forgot", c.forgotPasswordHandler)
 	r.HandleFunc("/v1/password/reset", c.resetPasswordHandler)
 	r.HandleFunc("/signup", c.signupPage)
+
+	// The authorize flow is three browser endpoints: the entry page (login or
+	// consent), the login form's POST, and the consent form's POST. The code
+	// and token endpoints come with the /token endpoint.
+	r.HandleFunc("/authorize", c.authorizeHandler)
+	r.HandleFunc("/authorize/login", c.authorizeLoginHandler)
+	r.HandleFunc("/authorize/consent", c.authorizeConsentHandler)
 
 	// OIDC discovery and the public key set. A relying party fetches these to
 	// learn the issuer and to verify tokens with the public key.
@@ -125,6 +136,11 @@ func (c *controller) purgeExpiredTokens() {
 			slog.Error("deleting expired password reset tokens", "error", err)
 		} else if n > 0 {
 			slog.Debug("deleted expired password reset tokens", "count", n)
+		}
+		if n, err := c.db.DeleteExpiredAuthorizationCodes(ctx); err != nil {
+			slog.Error("deleting expired authorization codes", "error", err)
+		} else if n > 0 {
+			slog.Debug("deleted expired authorization codes", "count", n)
 		}
 	}
 
@@ -282,16 +298,17 @@ func (c *controller) userByIDHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // requireSession rejects requests without a valid session token in the
-// Authorization header, then resolves the token's subject to a live, active
-// account and attaches it to the request context. Authorization — who may act
-// on which user — is left to the wrapped handler, which reads the caller with
-// callerFrom.
+// Authorization header or the session cookie, then resolves the token's
+// subject to a live, active account and attaches it to the request context.
+// Authorization — who may act on which user — is left to the wrapped handler,
+// which reads the caller with callerFrom.
 func (c *controller) requireSession(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		raw, ok := bearerToken(r.Header.Get("Authorization"))
 		if !ok {
-			// The admin panel navigates in a browser, which cannot set an
-			// Authorization header, so fall back to its session cookie.
+			// The admin panel and the authorize flow navigate in a browser,
+			// which cannot set an Authorization header, so fall back to the
+			// session cookie.
 			raw, ok = cookieSession(r)
 		}
 		if !ok {
@@ -299,58 +316,72 @@ func (c *controller) requireSession(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		claims := new(sessionClaims)
-		_, err := jwt.ParseWithClaims(raw, claims, c.sessionKey,
-			jwt.WithValidMethods([]string{jwt.SigningMethodES256.Alg()}),
-			jwt.WithExpirationRequired(),
-			jwt.WithIssuer(sessionIssuer),
-			jwt.WithAudience(sessionAudience),
-			jwt.WithIssuedAt(),
-		)
+		caller, ok, err := c.sessionUser(r, raw)
 		if err != nil {
-			slog.Debug("rejected session token", "error", err)
-			unauthorized(w)
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-
-		userID, err := uuid.Parse(claims.Subject)
-		if err != nil {
-			slog.Debug("session subject is not a user id", "subject", claims.Subject)
-			unauthorized(w)
-			return
-		}
-
-		// Resolve the subject on every request: a deleted or deactivated
-		// account must not keep using a token that has not expired yet, and
-		// handlers need the caller's admin flag to authorize the target.
-		caller, err := c.db.GetUserById(r.Context(), userID)
-		if err != nil {
-			if !errors.Is(err, pgx.ErrNoRows) {
-				slog.Error(err.Error())
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			unauthorized(w)
-			return
-		}
-		if !caller.Active {
-			unauthorized(w)
-			return
-		}
-
-		// A password change bumps the account's session epoch, retiring every
-		// session minted before it: without this a token stolen before the
-		// change would stay usable until it expired. Requiring the claim keeps
-		// a token from omitting it and comparing equal to a stale generation.
-		if claims.SessionEpoch == nil || *claims.SessionEpoch != caller.SessionEpoch {
-			slog.Debug("rejected session from a retired session epoch",
-				"subject", claims.Subject, "epoch", claims.SessionEpoch)
+		if !ok {
 			unauthorized(w)
 			return
 		}
 
 		next(w, r.WithContext(context.WithValue(r.Context(), callerKey{}, caller)))
 	}
+}
+
+// sessionUser validates a raw session token and resolves its subject to a
+// live, active account. It is the single implementation of the checks every
+// session must pass, shared by requireSession (API and panel) and the
+// authorize flow's cookie resolution, so a session one path accepts, all
+// paths accept. A false result with no error is a rejected session — a bad
+// signature, a dead account, a retired epoch — not an infrastructure failure;
+// requireSession answers that with 401, the authorize flow with a login page.
+func (c *controller) sessionUser(r *http.Request, raw string) (repository.User, bool, error) {
+	claims := new(sessionClaims)
+	_, err := jwt.ParseWithClaims(raw, claims, c.sessionKey,
+		jwt.WithValidMethods([]string{jwt.SigningMethodES256.Alg()}),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuer(sessionIssuer),
+		jwt.WithAudience(sessionAudience),
+		jwt.WithIssuedAt(),
+	)
+	if err != nil {
+		slog.Debug("rejected session token", "error", err)
+		return repository.User{}, false, nil
+	}
+
+	userID, err := uuid.Parse(claims.Subject)
+	if err != nil {
+		slog.Debug("session subject is not a user id", "subject", claims.Subject)
+		return repository.User{}, false, nil
+	}
+
+	// Resolve the subject on every request: a deleted or deactivated
+	// account must not keep using a token that has not expired yet, and
+	// handlers need the caller's admin flag to authorize the target.
+	caller, err := c.db.GetUserById(r.Context(), userID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return repository.User{}, false, err
+		}
+		return repository.User{}, false, nil
+	}
+	if !caller.Active {
+		return repository.User{}, false, nil
+	}
+
+	// A password change bumps the account's session epoch, retiring every
+	// session minted before it: without this a token stolen before the
+	// change would stay usable until it expired. Requiring the claim keeps
+	// a token from omitting it and comparing equal to a stale generation.
+	if claims.SessionEpoch == nil || *claims.SessionEpoch != caller.SessionEpoch {
+		slog.Debug("rejected session from a retired session epoch",
+			"subject", claims.Subject, "epoch", claims.SessionEpoch)
+		return repository.User{}, false, nil
+	}
+
+	return caller, true, nil
 }
 
 // callerKey is the request context key under which requireSession stores the

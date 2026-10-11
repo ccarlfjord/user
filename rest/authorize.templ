@@ -1,0 +1,108 @@
+package rest
+
+templ authorizeLayout(title string) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<title>{ title }</title>
+			<link rel="stylesheet" href="/static/admin.css"/>
+		</head>
+		<body>
+			{ children... }
+		</body>
+	</html>
+}
+
+// authorizeHiddenFields carries the original request parameters through the
+// login and consent forms. The POST handlers re-validate everything from
+// these fields rather than trusting anything stored in the session, so the
+// pages stay stateless and a stale form can never authorize a different
+// request than the one the user saw.
+templ authorizeHiddenFields(params authorizeParams) {
+	<input type="hidden" name="response_type" value={ params.ResponseType }/>
+	<input type="hidden" name="client_id" value={ params.ClientID }/>
+	<input type="hidden" name="redirect_uri" value={ params.RedirectURI }/>
+	<input type="hidden" name="scope" value={ params.Scope }/>
+	<input type="hidden" name="state" value={ params.State }/>
+	<input type="hidden" name="nonce" value={ params.Nonce }/>
+	<input type="hidden" name="code_challenge" value={ params.CodeChallenge }/>
+	<input type="hidden" name="code_challenge_method" value={ params.CodeChallengeMethod }/>
+}
+
+// authorizeErrorPage is shown for requests refused before the redirect URI was
+// validated — an unknown client, a missing or mismatched redirect_uri. These
+// never redirect, because redirecting to an unvalidated URL would let a bad
+// request turn the server into an open redirector.
+templ authorizeErrorPage(message string) {
+	@authorizeLayout("Authorization error") {
+		<h1>Authorization error</h1>
+		<p class="error">{ message }</p>
+		<p>The application that started this sign-in was configured incorrectly,
+			or the link you followed is malformed. Nothing was signed in or
+			shared.</p>
+	}
+}
+
+// authorizeLoginPage is the interactive login step of the browser flow. It is
+// deliberately not the JSON POST /v1/login and not the admin panel's form:
+// this one signs in an ordinary user to a cookie session, then returns them
+// to /authorize to finish the flow.
+templ authorizeLoginPage(params authorizeParams, message string) {
+	@authorizeLayout("Sign in") {
+		<h1>Sign in to continue</h1>
+		if message != "" {
+			<p class="error">{ message }</p>
+		}
+		<form class="stack" action="/authorize/login" method="post">
+			@authorizeHiddenFields(params)
+			<label>
+				Email
+				<input type="email" name="email" autocomplete="username" required/>
+			</label>
+			<label>
+				Password
+				<input type="password" name="password" autocomplete="current-password" required/>
+			</label>
+			<button type="submit">Sign in</button>
+		</form>
+	}
+}
+
+// authorizeConsentPage asks the user to approve the client's access. It is
+// asked on every authorization (remember-me comes later), so a user always
+// sees who is asking and for what before a code is issued.
+templ authorizeConsentPage(clientName string, scopes []string, params authorizeParams) {
+	@authorizeLayout("Authorize " + clientName) {
+		<h1>Authorize { clientName }</h1>
+		<p>
+			{ clientName } wants to access your account with these permissions.
+			You are signing in as the email address on this session.
+		</p>
+		<ul>
+			for _, scope := range scopes {
+				<li>{ scopeDescription(scope) }</li>
+			}
+		</ul>
+		<form class="stack" action="/authorize/consent" method="post">
+			@authorizeHiddenFields(params)
+			<button type="submit">Allow</button>
+			<button type="submit" name="deny" value="1">Deny</button>
+		</form>
+	}
+}
+
+// scopeDescription renders a scope as something a person can read. Scopes
+// outside the vocabulary cannot reach this page — they are rejected during
+// validation — so the switch covers every scope the flow can grant.
+func scopeDescription(scope string) string {
+	switch scope {
+	case ScopeOpenID:
+		return "Confirm who you are (your account id)"
+	case ScopeEmail:
+		return "See your email address"
+	default:
+		return scope
+	}
+}

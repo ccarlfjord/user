@@ -12,6 +12,12 @@ Ordered by priority; every item is grounded in the code as it stands.
 - [x] `sqlc generate` reproduces the checked-in tree unchanged (`sqlc v1.31.1`).
 - [x] `000004_session_invalidation` is applied to the local database by hand, as every migration is until a
       runner exists (see the P1 item); the `down` really reverses the `up`, unlike `000002`/`000003`.
+- [x] `/authorize` is live end to end (validation, login step, consent, code
+      issuance; migration `000009` applied by hand like the rest, and verified
+      with curl against the local database). Discovery now advertises
+      `authorization_endpoint`. The stale `jwt_signing_key` row — the HS256
+      secret sessions used before ES256 — was deleted; nothing has read it
+      since the key moved to `oidc_signing_key`.
 
 ## P0 — OIDC provider
 
@@ -75,28 +81,57 @@ token → userinfo → logout).
 
 ### Authorization endpoint (`GET /authorize`)
 
-- [ ] Request validation: `client_id` must resolve and be active,
-      `redirect_uri` must exact-match, `response_type=code` (only this),
-      `code_challenge`/`method` well-formed (S256 only). Errors go to the
-      redirect URI with `error=invalid_request` *only after* the redirect URI
-      is validated; before that, render an error page — never redirect to an
-      unvalidated URL.
-- [ ] Interactive login step: an HTML form, not the JSON `POST /v1/login`
-      (`rest/user.go`) and not the admin panel's (`/admin/login`). Reuse the
-      session cookie path if a valid session already exists — then `/authorize`
-      is one click, and the browser flow can ride the panel's session.
-- [ ] Consent step: show the client name and the scopes requested; record the
-      user's grant (or approval memory) before issuing the code. Can ship as
-      an always-ask page first, remember-me later.
-- [ ] Issue the code: 302 to `redirect_uri?code=...&state=...&iss=...`.
-      `state` is echoed, not stored server-side; `nonce` is stored with the
-      code for the ID token.
+- [x] Request validation (`rest/authorize.go`): `client_id` must resolve and be
+      active, `redirect_uri` must exact-match (`redirectURIRegistered`, byte for
+      byte), `response_type=code` (only this), and the PKCE pair must be a
+      well-formed S256 challenge (43–128 chars of the base64url alphabet; a
+      bare challenge without the method means plain and is refused). Refusals
+      are ordered by trust: client_id resolves first, then redirect_uri, and
+      only after that do `response_type`/`scope`/PKCE failures go back to the
+      redirect URI as `error=` redirects — everything before renders the error
+      page and never sets a Location header, so a malformed request cannot turn
+      the server into an open redirector. Unknown and inactive clients get the
+      same page. `openid` is required in the scope; every scope must be in the
+      provider vocabulary *and* the client's `allowed_scopes`.
+- [x] Interactive login step: its own HTML form (`/authorize/login`,
+      `rest/authorize.templ`), not the JSON `POST /v1/login` and not the admin
+      panel's. The session cookie path is shared: a valid cookie goes straight
+      to consent — one click if the user is already signed in anywhere in the
+      browser. Session checks run through `sessionUser` (`rest/server.go`), the
+      same validator `requireSession` uses, so a session one path accepts all
+      paths accept. The login POST re-validates the carried parameters before
+      authenticating, signs in with the same `authenticate` (generic failure
+      message, no enumeration), sets the session cookie, and 303s back through
+      `GET /authorize` so the browser re-enters the flow at the top.
+- [x] Consent step: always-ask page showing the client name and a plain-word
+      description of each requested scope (`scopeDescription`), Allow/Deny on
+      one form. Every POST re-validates the parameters from the hidden fields —
+      the pages are stateless, so a stale form cannot authorize a different
+      request than the one displayed. Deny redirects with `error=access_denied`.
+      Remember-me (skip consent for a remembered grant) is deferred.
+- [x] Issue the code: 302 to `redirect_uri?code=...&state=...&iss=...` (302,
+      not 303 — this one redirects the browser away from the provider, and the
+      RFC's §4.1.2 example is 302). `state` is echoed, never stored; `nonce`,
+      `scope`, `redirect_uri`, `code_challenge`, and the account's
+      `session_epoch` ride with the code row. A GET never mints a code: only
+      the consent POST does, so prefetchers that walk GETs cannot burn grants.
+      Registered redirect URIs may carry their own query — `redirectWithQuery`
+      appends with `&` when one is present.
 
 ### Authorization codes
 
-- [ ] `authorization_codes` table (migration): hash of the code, `client_id`,
-      `user_id`, `redirect_uri`, `scope`, `nonce`, `code_challenge`,
-      `session_epoch`, `expires_at` (short — minutes), consumed flag.
+- [x] `authorization_codes` table (migration `000009`): hash of the code
+      (SHA-256, primary key), `client_id` (FK, cascade on client delete),
+      `user_id` (FK, cascade), `redirect_uri`, `scope`, `nonce`,
+      `code_challenge` (raw challenge — the verifier is hashed at exchange
+      time), `session_epoch`, `expires_at` (10 min, `authorizationCodeTTL`).
+      Single-use by *deletion*: `ConsumeAuthorizationCode` is a
+      `DELETE ... RETURNING`, so a replayed code loses to the concurrent
+      exchange the way `ConsumeRefreshToken` works — there is no consumed flag
+      to leave half-burned rows behind. Expired codes join the daily purge.
+      The RFC 6749 §4.1.2 replay-punishment (revoke tokens minted from a
+      replayed code) and PKCE verification both land with `/token`, which is
+      the first consumer.
 - [ ] Atomic single-use consumption: `DELETE ... RETURNING` like
       `ConsumeRefreshToken`/`ConsumePasswordResetToken`, so a replayed code
       loses to the concurrent request. Also revoke the tokens issued from a

@@ -41,12 +41,16 @@ func TestOpenIDConfiguration(t *testing.T) {
 	if len(got.SubjectTypesSupported) != 1 || got.SubjectTypesSupported[0] != "public" {
 		t.Fatalf("subject_types_supported = %v, want [public]", got.SubjectTypesSupported)
 	}
-	// The endpoints that do not exist yet must not be advertised.
+	// The authorization endpoint is live; the ones that do not exist yet must
+	// not be advertised.
+	if got.AuthorizationEndpoint != testIssuer+"/authorize" {
+		t.Fatalf("authorization_endpoint = %q, want %q", got.AuthorizationEndpoint, testIssuer+"/authorize")
+	}
 	var raw map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
 		t.Fatalf("decode discovery document: %v", err)
 	}
-	for _, absent := range []string{"authorization_endpoint", "token_endpoint", "userinfo_endpoint"} {
+	for _, absent := range []string{"token_endpoint", "userinfo_endpoint"} {
 		if _, ok := raw[absent]; ok {
 			t.Fatalf("discovery advertises %q, which is not implemented", absent)
 		}
