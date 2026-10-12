@@ -47,7 +47,7 @@ func (c *controller) adminPageView(w http.ResponseWriter, r *http.Request) {
 	}
 
 	caller, _ := callerFrom(r.Context())
-	render(w, r, adminPage(users, q, caller.ID))
+	render(w, r, adminPage(users, q, caller.ID, c.keys.Load()))
 }
 
 // adminUserRows serves the table body on its own for the search field.
@@ -166,6 +166,26 @@ func (c *controller) adminDeleteUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// adminRotateSigningKey generates a new signing key on the operator's demand
+// and returns the refreshed panel fragment for htmx to swap in.
+func (c *controller) adminRotateSigningKeyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	c.adminRotateSigningKey(w, r)
+}
+
+func (c *controller) adminRotateSigningKey(w http.ResponseWriter, r *http.Request) {
+	if err := c.rotateSigningKey(r.Context()); err != nil {
+		slog.Error("rotating signing key", "error", err)
+		http.Error(w, "failed to rotate signing key", http.StatusInternalServerError)
+		return
+	}
+
+	render(w, r, signingKeyPanel(c.keys.Load()))
 }
 
 // adminPathID parses the {id} path value, answering 400 when it is not a UUID.

@@ -51,6 +51,8 @@ type fakeStore struct {
 	deleteExpiredPasswordResetTokens func(context.Context) (int64, error)
 	getUsers                         func(context.Context) ([]repository.User, error)
 	searchUsers                      func(context.Context, string) ([]repository.User, error)
+	listSigningKeys                  func(context.Context) ([]repository.SigningKey, error)
+	createSigningKey                 func(context.Context, repository.CreateSigningKeyParams) error
 }
 
 func (f fakeStore) GetClientById(ctx context.Context, clientID string) (repository.OauthClient, error) {
@@ -170,6 +172,20 @@ func (f fakeStore) SearchUsers(ctx context.Context, query string) ([]repository.
 	return f.searchUsers(ctx, query)
 }
 
+func (f fakeStore) ListSigningKeys(ctx context.Context) ([]repository.SigningKey, error) {
+	if f.listSigningKeys == nil {
+		return nil, nil
+	}
+	return f.listSigningKeys(ctx)
+}
+
+func (f fakeStore) CreateSigningKey(ctx context.Context, arg repository.CreateSigningKeyParams) error {
+	if f.createSigningKey == nil {
+		return nil
+	}
+	return f.createSigningKey(ctx, arg)
+}
+
 // testIssuer is the OIDC issuer identifier newTestController advertises.
 const testIssuer = "https://issuer.example.com"
 
@@ -187,11 +203,12 @@ func mustGenerateTestKey() *ecdsa.PrivateKey {
 }
 
 func newTestController(store userStore) *controller {
-	return &controller{
-		db:      store,
-		oidcKey: testSigningKey,
-		issuer:  testIssuer,
+	c := &controller{
+		db:     store,
+		issuer: testIssuer,
 	}
+	c.setKeys([]signingKey{{private: testSigningKey, created: time.Now()}})
+	return c
 }
 
 func doRequest(handler http.HandlerFunc, method, target, contentType, body string) *httptest.ResponseRecorder {

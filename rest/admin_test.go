@@ -29,6 +29,8 @@ func adminRoute(c *controller, path string) http.HandlerFunc {
 		return c.adminOnly(c.adminToggleAdminHandler)
 	case strings.HasSuffix(path, "/delete"):
 		return c.adminOnly(c.adminDeleteUserHandler)
+	case path == "/admin/signing-keys/rotate":
+		return c.adminOnly(c.adminRotateSigningKeyHandler)
 	default:
 		panic("unrouted admin target " + path)
 	}

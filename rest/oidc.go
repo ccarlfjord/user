@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -89,20 +90,27 @@ type jwksResponse struct {
 	Keys []jwk `json:"keys"`
 }
 
-// jwks publishes the public half of the signing key so a relying party can
-// verify a token without holding anything that could mint one.
+// jwks publishes the public half of every key still inside the overlap window,
+// so a relying party can verify a token without holding anything that could
+// mint one, and a token signed just before a rotation still resolves to a key.
 func (c *controller) jwks(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
 		return
 	}
-	if c.oidcKey == nil {
+
+	published := c.keys.Load().published(time.Now())
+	if len(published) == 0 {
 		slog.Error("JWKS requested before a signing key was loaded")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	JSON(w, http.StatusOK, jwksResponse{Keys: []jwk{publicJWK(&c.oidcKey.PublicKey)}})
+	keys := make([]jwk, 0, len(published))
+	for i := range published {
+		keys = append(keys, publicJWK(&published[i].private.PublicKey))
+	}
+	JSON(w, http.StatusOK, jwksResponse{Keys: keys})
 }
 
 func publicJWK(pub *ecdsa.PublicKey) jwk {

@@ -31,6 +31,11 @@ Ordered by priority; every item is grounded in the code as it stands.
       add. Argon2id remains reserved for `users.hashed_password`. Applied to
       the local database by hand like the rest, and verified end to end with
       curl.
+- [x] Multi-key signing-key rotation (`rest/signing_keys.go`): the
+      `signing_keys` table holds the key history, the newest key signs, the
+      JWKS keeps a retired key for the `sessionTTL` + 5m overlap, and the
+      admin panel gained a rotate action. Automatic rotation replaces the key
+      once it has served 30 days (start-up and the daily purge tick).
 
 ## P0 — OIDC provider
 
@@ -45,25 +50,25 @@ and validate the result.
       authorization/token/userinfo endpoints are deliberately absent until they exist rather than advertised
       as 404s. The issuer is resolved once at start-up by `oidcIssuer` from `OIDC_ISSUER`, falling back to
       `PUBLIC_BASE_URL`, so every future `iss` can match one configured URL.
-- [x] JWKS and asymmetric signing: the service signs with a persisted ES256 (P-256) key. `loadSigningKey`
-      (`main.go`) reads the `oidc_signing_key` row, generates a key only on first boot with a race-safe
-      `CreateSigningKey` (`ON CONFLICT DO NOTHING`) plus read-back, and refuses a stored key that is not
+- [x] JWKS and asymmetric signing: the service signs with a persisted ES256 (P-256) key. `refreshSigningKeys`
+      (`rest/signing_keys.go`) loads the stored keys, generates the first on a fresh database with a race-safe
+      `CreateSigningKey` (`ON CONFLICT DO NOTHING`) plus read-back, and refuses any stored key that is not
       P-256. `GET /.well-known/jwks.json` publishes its public half as an EC JWK (`kty`, `crv`, `x`, `y`,
       `use: sig`, `alg: ES256`) whose `kid` is the RFC 7638 thumbprint (`keyID`, `rest/oidc.go`), so an RP can
       verify without holding anything that mints. Sessions moved off HS256 with it: `mintSession` signs ES256
       and `requireSession`/`sessionKey` verify against the public key, pinned to that one algorithm.
 - [x] `kid` on tokens: `mintSession` sets the JWT header's `kid` to the RFC 7638 thumbprint of the signing
-      key, and `sessionKey` refuses a token whose `kid` is missing or is not the current key. With one key
-      that equality check is all there is; it becomes a lookup over the published set when rotation lands.
-- [ ] Multi-key rotation: one key exists and the JWKS advertises one `kid`. Rotation is overlap-only: generate
-      a new key and sign with it, publish both public keys in the JWKS, and drop the old one only once the
-      longest signed-token lifetime has passed since it was last used to sign. Nothing is revoked or deleted:
-      a token whose `kid` is no longer advertised has already expired. The bound is `sessionTTL` (1h, plus a
-      clock-skew margin), because refresh tokens are opaque random values and are not signed. Needs multiple
-      key rows selected by `created_at` (the fixed `oidc_signing_key` name holds only one), a JWKS that hides
-      a key after that window, and a `sessionKey` that verifies against the old key during the overlap.
-      Keeping a retired key published indefinitely is harmless at this scale, so the time filter is tidy-up,
-      not correctness (see the P1 signing-key item too).
+      key, and `sessionKey` refuses a token whose `kid` is missing or unknown. The lookup spans the whole
+      stored key set, so a token signed just before a rotation still resolves (see the rotation item below).
+- [x] Multi-key rotation: `signing_keys` now holds the whole key history, newest first by `created_at`, and
+      the newest key signs. The JWKS publishes it plus every older key whose replacement is younger than
+      `signingKeyRetention` (`sessionTTL` + 5m), and `sessionKey` resolves a token's `kid` across every
+      stored key, so a token signed just before a rotation still verifies. Two paths rotate: automatically
+      once the active key has served `signingKeyRotationInterval` (30 days), checked at start-up and on the
+      daily purge tick; and on demand from the admin panel (`POST /admin/signing-keys/rotate`). Automatic
+      rows are named for the due time, so instances that race collide on `name` and store exactly one key.
+      Nothing is revoked or deleted: a key past the window is only hidden, and a token whose `kid` is hidden
+      has already expired.
 Ordered so each item builds on the ones before it: schema first, then the
 endpoints in the order a relying party walks the flow (discover → authorize →
 token → userinfo → logout).
@@ -223,19 +228,11 @@ token → userinfo → logout).
 - [ ] `end_session_endpoint` (RP-initiated logout): clears the browser
       session and, if `jti`/epoch work exists, retires the tokens minted in
       that login.
-- [ ] Multi-key rotation: one key exists and the JWKS advertises one `kid`.
-      Rotation is overlap-only: generate a new key and sign with it, publish
-      both public keys in the JWKS, and drop the old one only once the
-      longest signed-token lifetime has passed since it was last used to
-      sign. Nothing is revoked or deleted: a token whose `kid` is no longer
-      advertised has already expired. The bound is `sessionTTL` (1h, plus a
-      clock-skew margin), because refresh tokens are opaque random values and
-      are not signed. Needs multiple key rows selected by `created_at` (the
-      fixed `oidc_signing_key` name holds only one), a JWKS that hides a key
-      after that window, and a `sessionKey` that verifies against the old key
-      during the overlap. Keeping a retired key published indefinitely is
-      harmless at this scale, so the time filter is tidy-up, not correctness
-      (see the P1 signing-key item too).
+- [x] Multi-key rotation: landed with the P0 OIDC provider item above. The
+      key set is stored newest first, the active key signs, `sessionKey`
+      verifies any stored `kid`, and the JWKS hides a key only after the
+      `sessionTTL` + 5m overlap. Automatic (30 days) and admin-triggered
+      (`POST /admin/signing-keys/rotate`) paths both exist.
 
 ## P0 — handlers
 

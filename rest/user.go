@@ -585,11 +585,15 @@ func (c *controller) mintSession(user repository.User) (string, error) {
 		},
 		SessionEpoch: &user.SessionEpoch,
 	})
-	// Name the key in the header so a verifier can select the right one from a
-	// rotating key set instead of trying every published key.
-	token.Header["kid"] = keyID(&c.oidcKey.PublicKey)
+	// Name the key in the header so a verifier selects the right one from the
+	// key set instead of trying every published key.
+	key := c.keys.Load().active()
+	if key == nil {
+		return "", errors.New("no signing key loaded")
+	}
+	token.Header["kid"] = keyID(&key.private.PublicKey)
 
-	return token.SignedString(c.oidcKey)
+	return token.SignedString(key.private)
 }
 
 // issueRefreshToken stores a new refresh token for user and returns the value

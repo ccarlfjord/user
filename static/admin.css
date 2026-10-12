@@ -142,3 +142,13 @@ button.link {
 }
 
 .empty { color: var(--muted); text-align: center; padding: 1.5rem; }
+
+.signing-keys {
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+.signing-keys h2 { font-size: 1rem; }
+.signing-keys p { color: var(--muted); font-size: .9rem; }
+.signing-keys .mono { color: var(--fg); margin-right: .5rem; }

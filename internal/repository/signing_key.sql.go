@@ -24,13 +24,26 @@ func (q *Queries) CreateSigningKey(ctx context.Context, arg CreateSigningKeyPara
 	return err
 }
 
-const getSigningKey = `-- name: GetSigningKey :one
-SELECT name, value, created_at FROM signing_keys WHERE name = $1
+const listSigningKeys = `-- name: ListSigningKeys :many
+SELECT name, value, created_at FROM signing_keys ORDER BY created_at DESC, name DESC
 `
 
-func (q *Queries) GetSigningKey(ctx context.Context, name string) (SigningKey, error) {
-	row := q.db.QueryRow(ctx, getSigningKey, name)
-	var i SigningKey
-	err := row.Scan(&i.Name, &i.Value, &i.CreatedAt)
-	return i, err
+func (q *Queries) ListSigningKeys(ctx context.Context) ([]SigningKey, error) {
+	rows, err := q.db.Query(ctx, listSigningKeys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SigningKey
+	for rows.Next() {
+		var i SigningKey
+		if err := rows.Scan(&i.Name, &i.Value, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

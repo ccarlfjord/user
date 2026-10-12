@@ -2,13 +2,13 @@ package rest
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ccarlfjord/user/internal/repository"
@@ -49,12 +49,14 @@ type userStore interface {
 	DeleteExpiredPasswordResetTokens(ctx context.Context) (int64, error)
 	GetUsers(ctx context.Context) ([]repository.User, error)
 	SearchUsers(ctx context.Context, query string) ([]repository.User, error)
+	ListSigningKeys(ctx context.Context) ([]repository.SigningKey, error)
+	CreateSigningKey(ctx context.Context, arg repository.CreateSigningKeyParams) error
 }
 
 type controller struct {
-	db      userStore
-	oidcKey *ecdsa.PrivateKey
-	issuer  string
+	db     userStore
+	keys   atomic.Pointer[keySet]
+	issuer string
 }
 
 type User struct {
@@ -64,12 +66,17 @@ type User struct {
 	Admin  bool      `json:"admin"`
 }
 
-func New(pool *pgxpool.Pool, oidcKey *ecdsa.PrivateKey) *controller {
-	return &controller{
-		db:      repository.New(pool),
-		oidcKey: oidcKey,
-		issuer:  oidcIssuer(),
+func New(ctx context.Context, pool *pgxpool.Pool) (*controller, error) {
+	c := &controller{
+		db:     repository.New(pool),
+		issuer: oidcIssuer(),
 	}
+	// Load the key set, generating the first key or a rotation that came due
+	// while the process was down.
+	if err := c.refreshSigningKeys(ctx); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 func (c *controller) Run() error {
@@ -107,6 +114,7 @@ func (c *controller) Run() error {
 	r.HandleFunc("/admin/users/{id}/toggle-active", c.adminOnly(c.adminToggleActiveHandler))
 	r.HandleFunc("/admin/users/{id}/toggle-admin", c.adminOnly(c.adminToggleAdminHandler))
 	r.HandleFunc("/admin/users/{id}/delete", c.adminOnly(c.adminDeleteUserHandler))
+	r.HandleFunc("/admin/signing-keys/rotate", c.adminOnly(c.adminRotateSigningKeyHandler))
 	r.HandleFunc("/admin/login", c.adminLoginHandler)
 	r.HandleFunc("/admin/logout", c.adminLogoutHandler)
 
@@ -124,8 +132,9 @@ func (c *controller) Run() error {
 const purgeExpiredInterval = 24 * time.Hour
 
 // purgeExpiredTokens deletes expired refresh and verification tokens on a
-// ticker so the tables do not grow without bound. It never stops the server:
-// a failed purge retries on the next tick.
+// ticker so the tables do not grow without bound, and on the same tick runs the
+// automatic signing-key rotation check. It never stops the server: a failed
+// purge or rotation retries on the next tick.
 func (c *controller) purgeExpiredTokens() {
 	run := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -154,6 +163,9 @@ func (c *controller) purgeExpiredTokens() {
 			slog.Error("deleting expired registration tokens", "error", err)
 		} else if n > 0 {
 			slog.Debug("deleted expired registration tokens", "count", n)
+		}
+		if err := c.refreshSigningKeys(ctx); err != nil {
+			slog.Error("refreshing signing keys", "error", err)
 		}
 	}
 
@@ -414,23 +426,21 @@ func mayAccessUser(caller repository.User, target uuid.UUID) bool {
 	return caller.Admin || caller.ID == target
 }
 
-// sessionKey returns the public half of the signing key, and only for ES256
-// tokens. The signing method is pinned so a token cannot be verified with an
-// algorithm the caller chose (alg confusion / "none").
+// sessionKey returns the public half of the signing key named by the token's
+// kid, and only for ES256 tokens. The signing method is pinned so a token
+// cannot be verified with an algorithm the caller chose (alg confusion /
+// "none"). The lookup covers every stored key, so a token signed just before a
+// rotation still verifies against the key that signed it.
 func (c *controller) sessionKey(t *jwt.Token) (any, error) {
 	if m, ok := t.Method.(*jwt.SigningMethodECDSA); !ok || m.Alg() != jwt.SigningMethodES256.Alg() {
 		return nil, fmt.Errorf("unexpected signing method %q", t.Method.Alg())
 	}
-	if c.oidcKey == nil {
-		return nil, errors.New("no signing key loaded")
-	}
-	// Select by key id. One key exists today, so any id but the current one is
-	// unknown; when rotation lands this becomes a lookup over the published key
-	// set so a token signed just before the switch still verifies.
-	if kid, _ := t.Header["kid"].(string); kid != keyID(&c.oidcKey.PublicKey) {
+	kid, _ := t.Header["kid"].(string)
+	pub := c.keys.Load().verificationKey(kid)
+	if pub == nil {
 		return nil, fmt.Errorf("unknown key id %q", kid)
 	}
-	return &c.oidcKey.PublicKey, nil
+	return pub, nil
 }
 
 // bearerToken extracts the token from an Authorization header value.

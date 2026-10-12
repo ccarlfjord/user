@@ -1,6 +1,8 @@
 package rest
 
 import (
+	"time"
+
 	"github.com/ccarlfjord/user/internal/repository"
 	"github.com/google/uuid"
 )
@@ -22,7 +24,7 @@ templ adminLayout(title string) {
 }
 
 // adminPage is the full users view. q is the active search term, if any.
-templ adminPage(users []repository.User, q string, self uuid.UUID) {
+templ adminPage(users []repository.User, q string, self uuid.UUID, set *keySet) {
 	@adminLayout("Users · admin") {
 		<div class="topbar">
 			<h1>Users</h1>
@@ -57,7 +59,37 @@ templ adminPage(users []repository.User, q string, self uuid.UUID) {
 				@userRows(users, self)
 			</tbody>
 		</table>
+		@signingKeyPanel(set)
 	}
+}
+
+// signingKeyPanel summarizes the active signing key and offers an
+// operator-triggered rotation. The old key stays published for the overlap
+// window, so rotating is safe at any time.
+templ signingKeyPanel(set *keySet) {
+	<section class="signing-keys" id="signing-keys">
+		<h2>Signing keys</h2>
+		if active := set.active(); active != nil {
+			<p>
+				Active <span class="mono">{ keyID(&active.private.PublicKey) }</span>
+				created { active.created.UTC().Format(time.RFC3339) }.
+			</p>
+			<p>
+				Published:
+				for _, kid := range set.publishedKids(time.Now()) {
+					<span class="mono">{ kid }</span>
+				}
+			</p>
+		} else {
+			<p>No signing key loaded.</p>
+		}
+		<button
+			hx-post="/admin/signing-keys/rotate"
+			hx-target="#signing-keys"
+			hx-swap="outerHTML"
+			hx-confirm="Rotate the signing key now? The old key stays published for the overlap window."
+		>Rotate signing key</button>
+	</section>
 }
 
 // userRows is the fragment swapped into the table body by search.
