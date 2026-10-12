@@ -1,0 +1,3 @@
+# Generated code
+rest/*_templ.go linguist-generated=true
+internal/repository/*.go linguist-generated=true
