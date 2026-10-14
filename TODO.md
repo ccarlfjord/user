@@ -10,8 +10,8 @@ Ordered by priority; every item is grounded in the code as it stands.
 - [x] The relocation (generated `signing_key`/`verification_token` queries, `sql/`, `static/`, session
       validation) is committed in `2342a24`; the working tree is clean apart from this file.
 - [x] `sqlc generate` reproduces the checked-in tree unchanged (`sqlc v1.31.1`).
-- [x] `000004_session_invalidation` is applied to the local database by hand, as every migration is until a
-      runner exists (see the P1 item); the `down` really reverses the `up`, unlike `000002`/`000003`.
+- [x] `000004_session_invalidation` is applied to the local database (by hand at the time, before
+      golang-migrate was adopted as the runner); the `down` really reverses the `up`, unlike `000002`/`000003`.
 - [x] `/authorize` is live end to end (validation, login step, consent, code
       issuance; migration `000009` applied by hand like the rest, and verified
       with curl against the local database). Discovery now advertises
@@ -36,6 +36,20 @@ Ordered by priority; every item is grounded in the code as it stands.
       JWKS keeps a retired key for the `sessionTTL` + 5m overlap, and the
       admin panel gained a rotate action. Automatic rotation replaces the key
       once it has served 30 days (start-up and the daily purge tick).
+- [x] RFC 7592 client registration management (`rest/client_management.go`,
+      migration `000011`): registration now returns a `registration_access_token`
+      and `registration_client_uri` alongside the client, and
+      `GET`/`PUT`/`DELETE /register/{client_id}` let the client read, replace,
+      or retire its own registration. The token is stored as a SHA-256 hash and
+      resolves the client and authenticates the caller in one query, so a token
+      for another client matches no row and an unauthenticated probe cannot tell
+      a registered client from an absent one (same `401`). PUT re-runs the exact
+      `/register` metadata validation, rotates the registration token on every
+      update, and rotates the client secret only when the client crosses from
+      public to confidential (a confidential client keeps the secret it holds).
+      The migration also stores `token_endpoint_auth_method`/`grant_types`/
+      `response_types`, which registration previously echoed and discarded, so a
+      management read answers with what the client actually registered.
 
 ## P0 — OIDC provider
 
@@ -97,17 +111,15 @@ token → userinfo → logout).
       and discovery's `scopes_supported` now lists exactly that shared list rather
       than an inline literal. `profile` comes when a `profile` claim exists to hang
       it on. Storing the grant per authorization is part of the codes item.
-- [ ] Client management surface: RFC 7591 *initial* registration is landed
-      (`/register`, gated by single-use registration tokens minted out of
-      band), but there is no way to mint those tokens yet except hand SQL
-      (`CreateRegistrationToken` in `sql/registration_token.sql`), and RFC
-      7591's client management endpoint (GET/PUT/DELETE on the registration)
-      is absent — a client cannot rotate its secret or update its redirect
-      URIs without hand SQL. Decide whether management comes through the admin
-      panel, RFC 7592, or nothing at all. Whatever creates clients must keep
-      owning the invariants: exact redirect URIs, scopes inside the provider
-      vocabulary, and the public/secret pairing (the schema holds the pairing;
-      registration holds the rest).
+- [x] Client management surface: RFC 7592 client management is landed
+      (`rest/client_management.go`, migration `000011`) — `POST /register`
+      returns a `registration_access_token` + `registration_client_uri`, and
+      `GET`/`PUT`/`DELETE /register/{client_id}` authenticate with that token
+      and keep the same invariants registration does (exact redirect URIs,
+      scopes inside the vocabulary, the public/secret pairing the schema
+      enforces). Still open: minting the *initial* registration tokens that
+      gate `/register` is hand SQL (`CreateRegistrationToken` in
+      `sql/registration_token.sql`) with no admin path yet.
 
 ### Authorization endpoint (`GET /authorize`)
 
@@ -362,16 +374,19 @@ token → userinfo → logout).
 - [ ] No `http.Server` timeouts (`ReadHeaderTimeout`, `ReadTimeout`, `IdleTimeout`) → slowloris exposure.
 - [x] `signupPage` and the panel assets are embedded: `static.Files` uses `go:embed` and is served with
       `http.ServeFileFS` / `http.FileServerFS`, so the binary no longer depends on its working directory.
-- [ ] No migration runner (no golang-migrate/goose); `migrations/*.sql` are applied by hand. Fold this into
-      startup migrations below so a fresh instance is ready without hand-applying them.
+- [x] Migration runner: golang-migrate is the standard way migrations are run, via the CLI
+      (`migrate -path migrations -database "$DATABASE_URL" up`), documented in `README.md` along with the
+      one-time `force 10` baseline for a database whose schema predates the runner. `migrations/*.sql` are
+      no longer hand-applied, and there is no startup runner (the SQLite item below is the only place that
+      still contemplates automatic-on-startup migrations).
 - [ ] Add a second database provider (SQLite) behind the repository interface: dialect-specific queries, a
       driver alongside `pgx`, and `DATABASE_URL`-driven selection, with migrations run automatically on
       startup so a fresh instance is ready without hand-applying them.
 
 ## P2 — hygiene
 
-- [ ] `README.md` documents the Podman dev container (e.g. `postgres-dev`); still to add `DATABASE_URL`,
-      `LOGLEVEL`, `PUBLIC_BASE_URL`, the routes, and the migrate/run steps.
+- [ ] `README.md` documents the Podman dev container (e.g. `postgres-dev`) and the golang-migrate
+      workflow; still to add `LOGLEVEL`, `PUBLIC_BASE_URL`, the routes, and the run steps.
 - [ ] `main_test.go` requires a live Postgres and defaults to `postgresql://postgres:postgres@localhost:5432`
       with no `t.Skip`, so any CI job needs a database service.
 - [ ] No CI workflow and no Dockerfile.

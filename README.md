@@ -29,5 +29,34 @@ Connect with `podman exec -it postgres-dev psql -U postgres`, or any host
 client via `localhost:5432` — the port forward reaches the container, there is
 no host Postgres.
 
-Migrations in `migrations/` are applied by hand, one file at a time, for now
-(see `TODO.md`); there is no runner yet.
+Migrations in `migrations/` are applied with the
+[golang-migrate](https://github.com/golang-migrate/migrate) CLI, the standard
+way this project runs migrations. There is no startup migration runner and no
+`goose`.
+
+Install the CLI with the Postgres driver compiled in, since the build tag is
+required or it will not recognize the `postgres://` scheme:
+
+    go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+
+The driver needs the `postgres://` scheme (not `postgresql://`) and
+`sslmode=disable` for the local server:
+
+    export DATABASE_URL='postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable'
+
+    migrate -path migrations -database "$DATABASE_URL" up        # apply pending
+    migrate -path migrations -database "$DATABASE_URL" down 1    # revert the last
+    migrate -path migrations -database "$DATABASE_URL" version   # current version + dirty state
+
+`migrate create -ext sql -dir migrations -seq <name>` scaffolds a new pair;
+files are named `{version}_{name}.up.sql` / `.down.sql`.
+
+The schema predates the runner, so an existing database has no
+`schema_migrations` table. Baseline it once before the first `up`, or migrate
+replays every migration from zero:
+
+    migrate -path migrations -database "$DATABASE_URL" force 10  # record 10 as applied, run nothing
+    migrate -path migrations -database "$DATABASE_URL" up
+
+`migtest` is a scratch database for exercising the full chain (`up` then
+`down`) before applying anything to `postgres`.

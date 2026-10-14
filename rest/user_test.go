@@ -25,7 +25,10 @@ import (
 
 type fakeStore struct {
 	getClientById                    func(context.Context, string) (repository.OauthClient, error)
+	getClientByRegistrationToken     func(context.Context, repository.GetClientByRegistrationTokenParams) (repository.OauthClient, error)
 	createClient                     func(context.Context, repository.CreateClientParams) (repository.OauthClient, error)
+	updateClient                     func(context.Context, repository.UpdateClientParams) (repository.OauthClient, error)
+	deleteClient                     func(context.Context, string) (int64, error)
 	createRegistrationToken          func(context.Context, repository.CreateRegistrationTokenParams) error
 	consumeRegistrationToken         func(context.Context, []byte) (repository.RegistrationToken, error)
 	deleteExpiredRegistrationTokens  func(context.Context) (int64, error)
@@ -64,6 +67,27 @@ func (f fakeStore) GetClientById(ctx context.Context, clientID string) (reposito
 
 func (f fakeStore) CreateClient(ctx context.Context, arg repository.CreateClientParams) (repository.OauthClient, error) {
 	return f.createClient(ctx, arg)
+}
+
+func (f fakeStore) GetClientByRegistrationToken(ctx context.Context, arg repository.GetClientByRegistrationTokenParams) (repository.OauthClient, error) {
+	if f.getClientByRegistrationToken == nil {
+		return repository.OauthClient{}, pgx.ErrNoRows
+	}
+	return f.getClientByRegistrationToken(ctx, arg)
+}
+
+func (f fakeStore) UpdateClient(ctx context.Context, arg repository.UpdateClientParams) (repository.OauthClient, error) {
+	if f.updateClient == nil {
+		return repository.OauthClient{}, pgx.ErrNoRows
+	}
+	return f.updateClient(ctx, arg)
+}
+
+func (f fakeStore) DeleteClient(ctx context.Context, clientID string) (int64, error) {
+	if f.deleteClient == nil {
+		return 0, nil
+	}
+	return f.deleteClient(ctx, clientID)
 }
 
 func (f fakeStore) CreateRegistrationToken(ctx context.Context, arg repository.CreateRegistrationTokenParams) error {

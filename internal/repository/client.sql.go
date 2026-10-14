@@ -10,19 +10,26 @@ import (
 )
 
 const createClient = `-- name: CreateClient :one
-INSERT INTO oauth_clients(client_id, client_secret_hash, is_public, name, redirect_uris, allowed_scopes, active)
-VALUES($1, $2, $3, $4, $5, $6, $7)
-RETURNING client_id, client_secret_hash, is_public, name, redirect_uris, allowed_scopes, active, created_at
+INSERT INTO oauth_clients(
+    client_id, client_secret_hash, is_public, name, redirect_uris, allowed_scopes,
+    token_endpoint_auth_method, grant_types, response_types, registration_access_token_hash, active
+)
+VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+RETURNING client_id, client_secret_hash, is_public, name, redirect_uris, allowed_scopes, active, created_at, registration_access_token_hash, token_endpoint_auth_method, grant_types, response_types
 `
 
 type CreateClientParams struct {
-	ClientID         string   `json:"client_id"`
-	ClientSecretHash []byte   `json:"client_secret_hash"`
-	IsPublic         bool     `json:"is_public"`
-	Name             string   `json:"name"`
-	RedirectUris     []string `json:"redirect_uris"`
-	AllowedScopes    []string `json:"allowed_scopes"`
-	Active           bool     `json:"active"`
+	ClientID                    string   `json:"client_id"`
+	ClientSecretHash            []byte   `json:"client_secret_hash"`
+	IsPublic                    bool     `json:"is_public"`
+	Name                        string   `json:"name"`
+	RedirectUris                []string `json:"redirect_uris"`
+	AllowedScopes               []string `json:"allowed_scopes"`
+	TokenEndpointAuthMethod     string   `json:"token_endpoint_auth_method"`
+	GrantTypes                  []string `json:"grant_types"`
+	ResponseTypes               []string `json:"response_types"`
+	RegistrationAccessTokenHash []byte   `json:"registration_access_token_hash"`
+	Active                      bool     `json:"active"`
 }
 
 func (q *Queries) CreateClient(ctx context.Context, arg CreateClientParams) (OauthClient, error) {
@@ -33,6 +40,10 @@ func (q *Queries) CreateClient(ctx context.Context, arg CreateClientParams) (Oau
 		arg.Name,
 		arg.RedirectUris,
 		arg.AllowedScopes,
+		arg.TokenEndpointAuthMethod,
+		arg.GrantTypes,
+		arg.ResponseTypes,
+		arg.RegistrationAccessTokenHash,
 		arg.Active,
 	)
 	var i OauthClient
@@ -45,6 +56,10 @@ func (q *Queries) CreateClient(ctx context.Context, arg CreateClientParams) (Oau
 		&i.AllowedScopes,
 		&i.Active,
 		&i.CreatedAt,
+		&i.RegistrationAccessTokenHash,
+		&i.TokenEndpointAuthMethod,
+		&i.GrantTypes,
+		&i.ResponseTypes,
 	)
 	return i, err
 }
@@ -62,7 +77,7 @@ func (q *Queries) DeleteClient(ctx context.Context, clientID string) (int64, err
 }
 
 const getClientById = `-- name: GetClientById :one
-SELECT client_id, client_secret_hash, is_public, name, redirect_uris, allowed_scopes, active, created_at FROM oauth_clients WHERE client_id = $1
+SELECT client_id, client_secret_hash, is_public, name, redirect_uris, allowed_scopes, active, created_at, registration_access_token_hash, token_endpoint_auth_method, grant_types, response_types FROM oauth_clients WHERE client_id = $1
 `
 
 func (q *Queries) GetClientById(ctx context.Context, clientID string) (OauthClient, error) {
@@ -77,6 +92,103 @@ func (q *Queries) GetClientById(ctx context.Context, clientID string) (OauthClie
 		&i.AllowedScopes,
 		&i.Active,
 		&i.CreatedAt,
+		&i.RegistrationAccessTokenHash,
+		&i.TokenEndpointAuthMethod,
+		&i.GrantTypes,
+		&i.ResponseTypes,
+	)
+	return i, err
+}
+
+const getClientByRegistrationToken = `-- name: GetClientByRegistrationToken :one
+SELECT client_id, client_secret_hash, is_public, name, redirect_uris, allowed_scopes, active, created_at, registration_access_token_hash, token_endpoint_auth_method, grant_types, response_types FROM oauth_clients
+WHERE client_id = $1 AND registration_access_token_hash = $2
+`
+
+type GetClientByRegistrationTokenParams struct {
+	ClientID                    string `json:"client_id"`
+	RegistrationAccessTokenHash []byte `json:"registration_access_token_hash"`
+}
+
+// GetClientByRegistrationToken resolves the client a management request names
+// and authenticates it in one lookup: a token that belongs to a different
+// client matches no row, so the caller cannot manage a client it was not
+// registered as.
+func (q *Queries) GetClientByRegistrationToken(ctx context.Context, arg GetClientByRegistrationTokenParams) (OauthClient, error) {
+	row := q.db.QueryRow(ctx, getClientByRegistrationToken, arg.ClientID, arg.RegistrationAccessTokenHash)
+	var i OauthClient
+	err := row.Scan(
+		&i.ClientID,
+		&i.ClientSecretHash,
+		&i.IsPublic,
+		&i.Name,
+		&i.RedirectUris,
+		&i.AllowedScopes,
+		&i.Active,
+		&i.CreatedAt,
+		&i.RegistrationAccessTokenHash,
+		&i.TokenEndpointAuthMethod,
+		&i.GrantTypes,
+		&i.ResponseTypes,
+	)
+	return i, err
+}
+
+const updateClient = `-- name: UpdateClient :one
+UPDATE oauth_clients
+SET client_secret_hash = $2,
+    is_public = $3,
+    name = $4,
+    redirect_uris = $5,
+    allowed_scopes = $6,
+    token_endpoint_auth_method = $7,
+    grant_types = $8,
+    response_types = $9,
+    registration_access_token_hash = $10
+WHERE client_id = $1
+RETURNING client_id, client_secret_hash, is_public, name, redirect_uris, allowed_scopes, active, created_at, registration_access_token_hash, token_endpoint_auth_method, grant_types, response_types
+`
+
+type UpdateClientParams struct {
+	ClientID                    string   `json:"client_id"`
+	ClientSecretHash            []byte   `json:"client_secret_hash"`
+	IsPublic                    bool     `json:"is_public"`
+	Name                        string   `json:"name"`
+	RedirectUris                []string `json:"redirect_uris"`
+	AllowedScopes               []string `json:"allowed_scopes"`
+	TokenEndpointAuthMethod     string   `json:"token_endpoint_auth_method"`
+	GrantTypes                  []string `json:"grant_types"`
+	ResponseTypes               []string `json:"response_types"`
+	RegistrationAccessTokenHash []byte   `json:"registration_access_token_hash"`
+}
+
+func (q *Queries) UpdateClient(ctx context.Context, arg UpdateClientParams) (OauthClient, error) {
+	row := q.db.QueryRow(ctx, updateClient,
+		arg.ClientID,
+		arg.ClientSecretHash,
+		arg.IsPublic,
+		arg.Name,
+		arg.RedirectUris,
+		arg.AllowedScopes,
+		arg.TokenEndpointAuthMethod,
+		arg.GrantTypes,
+		arg.ResponseTypes,
+		arg.RegistrationAccessTokenHash,
+	)
+	var i OauthClient
+	err := row.Scan(
+		&i.ClientID,
+		&i.ClientSecretHash,
+		&i.IsPublic,
+		&i.Name,
+		&i.RedirectUris,
+		&i.AllowedScopes,
+		&i.Active,
+		&i.CreatedAt,
+		&i.RegistrationAccessTokenHash,
+		&i.TokenEndpointAuthMethod,
+		&i.GrantTypes,
+		&i.ResponseTypes,
 	)
 	return i, err
 }

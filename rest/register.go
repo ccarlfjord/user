@@ -33,9 +33,10 @@ const grantTypeAuthorizationCode = "authorization_code"
 // maxClientNameLength caps the name the consent page will render.
 const maxClientNameLength = 200
 
-// registrationRequest is the client metadata an RP posts to /register. Only
-// the members this provider has somewhere to put are named; RFC 7591 says
-// unrecognized members are ignored, so unknown fields decode away harmlessly.
+// registrationRequest is the client metadata an RP posts to /register, and
+// the same body a management PUT sends under RFC 7592. Only the members this
+// provider has somewhere to put are named; RFC 7591 says unrecognized members
+// are ignored, so unknown fields decode away harmlessly.
 type registrationRequest struct {
 	RedirectURIs            []string `json:"redirect_uris"`
 	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
@@ -46,10 +47,12 @@ type registrationRequest struct {
 	Contacts                []string `json:"contacts"` // accepted, not stored yet
 }
 
-// registrationResponse is the effective registration returned on 201. It
-// echoes the server's defaults for members the request omitted, and returns
-// client_secret once, in plaintext, for a confidential client — only its
-// SHA-256 hash is stored, so it cannot be recovered later.
+// registrationResponse is the effective registration returned on 201 and on a
+// management read or update. It echoes the server's defaults for members the
+// request omitted, and returns client_secret once, in plaintext, for a
+// confidential client — only its SHA-256 hash is stored, so it cannot be
+// recovered later. registration_access_token is likewise returned once per
+// issuance, and authenticates the RFC 7592 management endpoints.
 type registrationResponse struct {
 	ClientID                string   `json:"client_id"`
 	ClientIDIssuedAt        int64    `json:"client_id_issued_at"`
@@ -61,6 +64,11 @@ type registrationResponse struct {
 	RedirectURIs            []string `json:"redirect_uris"`
 	ClientName              string   `json:"client_name"`
 	Scope                   string   `json:"scope"`
+	// Included only when this response just minted the token. A read cannot
+	// echo it back (only the hash is stored), so omitting it beats handing the
+	// client an empty string to overwrite its stored copy with.
+	RegistrationAccessToken string `json:"registration_access_token,omitempty"`
+	RegistrationClientURI   string `json:"registration_client_uri"`
 }
 
 // registrationError is the RFC 7591 §3.2.2 error body. invalid_redirect_uri
@@ -110,7 +118,7 @@ func (c *controller) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	params, effective, regErr, ok := validateRegistration(req)
+	metadata, regErr, ok := validateClientMetadata(req, tokenAuthMethodBasic)
 	if !ok {
 		registrationErrorResponse(w, http.StatusBadRequest, regErr.code, regErr.description)
 		return
@@ -136,47 +144,112 @@ func (c *controller) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client, err := c.db.CreateClient(r.Context(), params)
+	creds, err := mintClientCredentials(metadata.IsPublic)
 	if err != nil {
 		slog.Error(err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
+	client, err := c.db.CreateClient(r.Context(), newClientParams(metadata, creds))
+	if err != nil {
+		slog.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	slog.Debug("registered client", "client_id", client.ClientID, "public", metadata.IsPublic)
+	JSON(w, http.StatusCreated, c.clientInformation(client, creds))
+}
+
+// clientMetadata is the validated, defaulted client metadata shared by
+// registration and management updates. It carries no credentials and no
+// client id: those are minted per operation, so a PUT cannot accidentally
+// reuse or discard the wrong one.
+type clientMetadata struct {
+	TokenEndpointAuthMethod string
+	IsPublic                bool
+	Name                    string
+	RedirectURIs            []string
+	AllowedScopes           []string
+	GrantTypes              []string
+	ResponseTypes           []string
+}
+
+// clientCredentials are the plaintext secrets minted for a client. Each is
+// returned exactly once and stored only as a hash; an empty field means the
+// operation did not re-issue that credential.
+type clientCredentials struct {
+	ClientSecret            string
+	RegistrationAccessToken string
+}
+
+// mintClientCredentials generates the credentials a fresh registration needs:
+// a client secret for a confidential client, and always a registration access
+// token for the RFC 7592 management endpoints.
+func mintClientCredentials(isPublic bool) (clientCredentials, error) {
+	var creds clientCredentials
+	if !isPublic {
+		secret, err := generateToken()
+		if err != nil {
+			return clientCredentials{}, err
+		}
+		creds.ClientSecret = secret
+	}
+	token, err := generateToken()
+	if err != nil {
+		return clientCredentials{}, err
+	}
+	creds.RegistrationAccessToken = token
+	return creds, nil
+}
+
+// newClientParams assembles the store call for a fresh registration.
+func newClientParams(metadata clientMetadata, creds clientCredentials) repository.CreateClientParams {
+	params := repository.CreateClientParams{
+		ClientID:                    uuid.NewString(),
+		IsPublic:                    metadata.IsPublic,
+		Name:                        metadata.Name,
+		RedirectUris:                metadata.RedirectURIs,
+		AllowedScopes:               metadata.AllowedScopes,
+		TokenEndpointAuthMethod:     metadata.TokenEndpointAuthMethod,
+		GrantTypes:                  metadata.GrantTypes,
+		ResponseTypes:               metadata.ResponseTypes,
+		RegistrationAccessTokenHash: hashToken(creds.RegistrationAccessToken),
+		Active:                      true,
+	}
+	if creds.ClientSecret != "" {
+		params.ClientSecretHash = hashToken(creds.ClientSecret)
+	}
+	return params
+}
+
+// clientInformation renders a stored client as the RFC 7591/7592 client
+// information response. A secret or registration token is included only when
+// the operation just minted it, so a read does not pretend to return a
+// credential the server can no longer reconstruct.
+func (c *controller) clientInformation(client repository.OauthClient, creds clientCredentials) registrationResponse {
 	response := registrationResponse{
 		ClientID:                client.ClientID,
-		ClientIDIssuedAt:        time.Now().Unix(),
-		TokenEndpointAuthMethod: effective.TokenEndpointAuthMethod,
-		GrantTypes:              effective.GrantTypes,
-		ResponseTypes:           effective.ResponseTypes,
-		RedirectURIs:            params.RedirectUris,
-		ClientName:              params.Name,
-		Scope:                   effective.Scope,
+		ClientIDIssuedAt:        client.CreatedAt.Unix(),
+		TokenEndpointAuthMethod: client.TokenEndpointAuthMethod,
+		GrantTypes:              client.GrantTypes,
+		ResponseTypes:           client.ResponseTypes,
+		RedirectURIs:            client.RedirectUris,
+		ClientName:              client.Name,
+		Scope:                   strings.Join(client.AllowedScopes, " "),
+		RegistrationAccessToken: creds.RegistrationAccessToken,
+		RegistrationClientURI:   c.issuer + "/register/" + client.ClientID,
 	}
-	if effective.ClientSecret != "" {
+	if creds.ClientSecret != "" {
 		// client_secret_expires_at is REQUIRED whenever client_secret is
 		// returned; 0 means it does not expire. The secret itself exists only
 		// in this response.
 		never := int64(0)
-		response.ClientSecret = effective.ClientSecret
+		response.ClientSecret = creds.ClientSecret
 		response.ClientSecretExpiresAt = &never
-		slog.Debug("registered confidential client", "client_id", client.ClientID)
-	} else {
-		slog.Debug("registered public client", "client_id", client.ClientID)
 	}
-
-	JSON(w, http.StatusCreated, response)
-}
-
-// effectiveRegistration is the metadata the registration actually takes,
-// with the request's omissions filled in by their defaults — the response
-// echoes these, so the RP sees exactly what was registered.
-type effectiveRegistration struct {
-	ClientSecret            string
-	TokenEndpointAuthMethod string
-	GrantTypes              []string
-	ResponseTypes           []string
-	Scope                   string
+	return response
 }
 
 // regErr carries one of RFC 7591's two registration error codes.
@@ -185,13 +258,21 @@ type regErr struct {
 	description string
 }
 
-// validateRegistration turns posted metadata into a CreateClient call. Every
-// omission gets its RFC default; everything outside the defaults is refused —
-// the store's CHECK constraints catch what this does not.
-func validateRegistration(req registrationRequest) (repository.CreateClientParams, effectiveRegistration, regErr, bool) {
-	invalid := func(description string) (repository.CreateClientParams, effectiveRegistration, regErr, bool) {
-		return repository.CreateClientParams{}, effectiveRegistration{},
-			regErr{code: "invalid_client_metadata", description: description}, false
+// validateClientMetadata applies every rule a registration must pass: the
+// redirect URIs are usable exact-match strings, the auth method maps to
+// public or confidential, the grant and response types are in the provider's
+// fixed sets, the name exists for the consent page, and the scope is inside
+// both the provider vocabulary and nothing wider. Every omission gets a
+// default; everything outside the defaults is refused. Both /register and a
+// management PUT run this, so a PUT cannot smuggle in metadata a fresh
+// registration would have rejected. defaultMethod is the method applied when
+// the request omits one: registration passes the RFC's client_secret_basic,
+// while a management update passes the client's current method so an update
+// that only renames a client does not silently flip it between public and
+// confidential.
+func validateClientMetadata(req registrationRequest, defaultMethod string) (clientMetadata, regErr, bool) {
+	invalid := func(description string) (clientMetadata, regErr, bool) {
+		return clientMetadata{}, regErr{code: "invalid_client_metadata", description: description}, false
 	}
 
 	// redirect_uris: required, exact-match strings, stored verbatim. An https
@@ -199,22 +280,21 @@ func validateRegistration(req registrationRequest) (repository.CreateClientParam
 	// development (RFC 8252). No fragments — a fragment never reaches a
 	// server, so it could not match at redirect time anyway.
 	if len(req.RedirectURIs) == 0 {
-		return repository.CreateClientParams{}, effectiveRegistration{},
-			regErr{code: "invalid_redirect_uri", description: "at least one redirect_uri is required"}, false
+		return clientMetadata{}, regErr{code: "invalid_redirect_uri", description: "at least one redirect_uri is required"}, false
 	}
 	for _, uri := range req.RedirectURIs {
 		if !validRegistrationRedirectURI(uri) {
-			return repository.CreateClientParams{}, effectiveRegistration{},
-				regErr{code: "invalid_redirect_uri",
-					description: "redirect_uri must be an absolute https URL (or http on loopback), without a fragment"}, false
+			return clientMetadata{}, regErr{code: "invalid_redirect_uri",
+				description: "redirect_uri must be an absolute https URL (or http on loopback), without a fragment"}, false
 		}
 	}
 
-	// token_endpoint_auth_method: defaults to client_secret_basic, i.e. a
-	// confidential client holding a secret. `none` makes it public.
+	// token_endpoint_auth_method: defaults to defaultMethod — client_secret_basic
+	// (a confidential client holding a secret) on registration, or the client's
+	// existing method on a management update. `none` makes it public.
 	method := req.TokenEndpointAuthMethod
 	if method == "" {
-		method = tokenAuthMethodBasic
+		method = defaultMethod
 	}
 	var isPublic bool
 	switch method {
@@ -282,41 +362,15 @@ func validateRegistration(req registrationRequest) (repository.CreateClientParam
 		return invalid("scope must be a space-separated subset of the scopes this provider supports")
 	}
 
-	params := repository.CreateClientParams{
-		ClientID:      uuid.NewString(),
-		IsPublic:      isPublic,
-		Name:          name,
-		RedirectUris:  req.RedirectURIs,
-		AllowedScopes: scopes,
-		Active:        true,
-	}
-	effective := effectiveRegistration{
+	return clientMetadata{
 		TokenEndpointAuthMethod: method,
+		IsPublic:                isPublic,
+		Name:                    name,
+		RedirectURIs:            req.RedirectURIs,
+		AllowedScopes:           scopes,
 		GrantTypes:              grantTypes,
 		ResponseTypes:           responseTypes,
-		Scope:                   strings.Join(scopes, " "),
-	}
-
-	// A confidential client gets a random secret now, hashed for the store;
-	// the plaintext is returned once and exists nowhere else. It is hashed
-	// with SHA-256, not argon2id: the secret is server-generated 256-bit
-	// randomness, so there is no low-entropy guess to slow down and no salt
-	// to make precomputation infeasible — a fast hash is already
-	// irreversible against it. Argon2id stays reserved for passwords, the
-	// only credential a person chooses; /token verifies this hash with the
-	// same single hashToken() lookup refresh and registration tokens use.
-	if !isPublic {
-		secret, err := generateToken()
-		if err != nil {
-			slog.Error(err.Error())
-			return repository.CreateClientParams{}, effectiveRegistration{},
-				regErr{code: "invalid_client_metadata", description: "failed to mint a client secret"}, false
-		}
-		params.ClientSecretHash = hashToken(secret)
-		effective.ClientSecret = secret
-	}
-
-	return params, effective, regErr{}, true
+	}, regErr{}, true
 }
 
 // validRegistrationRedirectURI checks one redirect_uri at registration time:

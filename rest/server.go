@@ -24,7 +24,10 @@ import (
 type userStore interface {
 	GetUserByEmail(ctx context.Context, email string) (repository.User, error)
 	GetClientById(ctx context.Context, clientID string) (repository.OauthClient, error)
+	GetClientByRegistrationToken(ctx context.Context, arg repository.GetClientByRegistrationTokenParams) (repository.OauthClient, error)
 	CreateClient(ctx context.Context, arg repository.CreateClientParams) (repository.OauthClient, error)
+	UpdateClient(ctx context.Context, arg repository.UpdateClientParams) (repository.OauthClient, error)
+	DeleteClient(ctx context.Context, clientID string) (int64, error)
 	CreateRegistrationToken(ctx context.Context, arg repository.CreateRegistrationTokenParams) error
 	ConsumeRegistrationToken(ctx context.Context, tokenHash []byte) (repository.RegistrationToken, error)
 	DeleteExpiredRegistrationTokens(ctx context.Context) (int64, error)
@@ -99,8 +102,11 @@ func (c *controller) Run() error {
 	r.HandleFunc("/authorize/consent", c.authorizeConsentHandler)
 
 	// RFC 7591 dynamic client registration: a machine-to-machine POST, gated
-	// by a single-use registration token minted out-of-band.
+	// by a single-use registration token minted out-of-band. RFC 7592 client
+	// management reuses the path with the client id, authenticated by the
+	// registration access token registration hands back.
 	r.HandleFunc("/register", c.registerHandler)
+	r.HandleFunc("/register/{client_id}", c.clientRegistrationHandler)
 
 	// OIDC discovery and the public key set. A relying party fetches these to
 	// learn the issuer and to verify tokens with the public key.

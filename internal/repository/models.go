@@ -24,14 +24,18 @@ type AuthorizationCode struct {
 }
 
 type OauthClient struct {
-	ClientID         string    `json:"client_id"`
-	ClientSecretHash []byte    `json:"client_secret_hash"`
-	IsPublic         bool      `json:"is_public"`
-	Name             string    `json:"name"`
-	RedirectUris     []string  `json:"redirect_uris"`
-	AllowedScopes    []string  `json:"allowed_scopes"`
-	Active           bool      `json:"active"`
-	CreatedAt        time.Time `json:"created_at"`
+	ClientID                    string    `json:"client_id"`
+	ClientSecretHash            []byte    `json:"client_secret_hash"`
+	IsPublic                    bool      `json:"is_public"`
+	Name                        string    `json:"name"`
+	RedirectUris                []string  `json:"redirect_uris"`
+	AllowedScopes               []string  `json:"allowed_scopes"`
+	Active                      bool      `json:"active"`
+	CreatedAt                   time.Time `json:"created_at"`
+	RegistrationAccessTokenHash []byte    `json:"registration_access_token_hash"`
+	TokenEndpointAuthMethod     string    `json:"token_endpoint_auth_method"`
+	GrantTypes                  []string  `json:"grant_types"`
+	ResponseTypes               []string  `json:"response_types"`
 }
 
 type PasswordResetToken struct {
